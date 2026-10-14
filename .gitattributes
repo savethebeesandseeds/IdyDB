@@ -1,0 +1,2 @@
+*.sh text eol=lf
+dev/packages.lock text eol=lf

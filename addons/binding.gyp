@@ -1,24 +1,32 @@
 {
+  "variables": {
+    "idydb_testing%": 0
+  },
   "targets": [
     {
       "target_name": "idydb",
       "sources": [
         "addon.cpp",
-        "idydb/impl/db.cpp"
+        "../idydb/impl/db.cpp"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")",
-        "idydb/include"
+        "../idydb/include"
       ],
       "dependencies": [
         "<!(node -p \"require('node-addon-api').gyp\")"
       ],
       "defines": [
-        "NODE_ADDON_API_DISABLE_CPP_EXCEPTIONS"
+        "NODE_ADDON_API_CPP_EXCEPTIONS",
+        "NODE_ADDON_API_CPP_EXCEPTIONS_ALL"
       ],
       "cflags_cc": [ "-std=c++17" ],
+      "cflags_cc!": [ "-fno-exceptions" ],
 
       "conditions": [
+        ["idydb_testing==1", {
+          "defines": [ "IDYDB_TESTING=1" ]
+        }],
         ["OS==\"linux\"", {
           "libraries": [ "-lssl", "-lcrypto" ]
         }],
@@ -26,12 +34,13 @@
         ["OS==\"mac\"", {
           "xcode_settings": {
             "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
+            "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
             "MACOSX_DEPLOYMENT_TARGET": "10.15"
           },
           "libraries": [ "-lssl", "-lcrypto" ],
           "include_dirs": [
             "<!@(node -p \"require('node-addon-api').include\")",
-            "idydb/include",
+            "../idydb/include",
             "<!(node -p \"process.env.OPENSSL_INCLUDE_DIR || ''\")"
           ],
           "library_dirs": [
@@ -48,6 +57,7 @@
           "msvs_settings": {
             "VCCLCompilerTool": {
               "LanguageStandard": "stdcpp17",
+              "ExceptionHandling": 1,
               "AdditionalOptions": [
                 "/std:c++17"
               ]
@@ -55,7 +65,7 @@
           },
           "include_dirs": [
             "<!@(node -p \"require('node-addon-api').include\")",
-            "idydb/include",
+            "../idydb/include",
             "<!(node -p \"process.env.OPENSSL_INCLUDE_DIR || ''\")"
           ],
           "library_dirs": [

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
 
 #if defined(_WIN32)
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -106,15 +107,74 @@ static int flock(int fd, int operation)
 
 #include "db.h"
 
+/* Fault injection is compiled only into a private regression-test library. */
+#ifdef IDYDB_TESTING
+#include "../tests/failure_hooks.h"
+static idydb_test_hook idydb_fault_hook = NULL;
+static void* idydb_fault_user = NULL;
+extern "C" void idydb_test_set_hook(idydb_test_hook hook, void* user)
+{
+	idydb_fault_hook = hook;
+	idydb_fault_user = user;
+}
+static int idydb_fault(int point)
+{
+	int failure = idydb_fault_hook ? idydb_fault_hook(point, idydb_fault_user) : 0;
+	if (failure) errno = failure;
+	return failure;
+}
+static int idydb_fault_seek(FILE* stream, long long offset, int whence)
+{
+	if (idydb_fault(IDYDB_TEST_SEEK)) return -1;
+	return fseek(stream, offset, whence);
+}
+static size_t idydb_fault_write(const void* data, size_t size, size_t count, FILE* stream)
+{
+	int failure = idydb_fault(IDYDB_TEST_WRITE);
+	if (!failure) return fwrite(data, size, count, stream);
+	if (!size || !count) return 0;
+	size_t prefix = size * count / 2;
+	if (prefix) (void)fwrite(data, 1, prefix, stream);
+	errno = failure;
+	return prefix / size;
+}
+static int idydb_fault_flush(FILE* stream)
+{
+	if (idydb_fault(IDYDB_TEST_FLUSH)) return EOF;
+	return fflush(stream);
+}
+static int idydb_fault_sync(int fd)
+{
+	if (idydb_fault(IDYDB_TEST_FILE_SYNC)) return -1;
+	return fsync(fd);
+}
+static int idydb_fault_lock(int fd, int operation)
+{
+	if (!(operation & LOCK_UN) && idydb_fault(IDYDB_TEST_LOCK)) return -1;
+	return flock(fd, operation);
+}
+#undef fseek
+#undef fsync
+#define fseek idydb_fault_seek
+#define fwrite idydb_fault_write
+#define fflush idydb_fault_flush
+#define fsync idydb_fault_sync
+#define flock idydb_fault_lock
+#define IDYDB_FAULT(point) idydb_fault(point)
+#else
+#define IDYDB_FAULT(point) 0
+#endif
+
 /* IdyDB database operations (internal) */
 static int idydb_new(idydb **handler);
 static void idydb_destroy(idydb **handler);
 static int idydb_connection_setup(idydb **handler, const char *filename, int flags);
-static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flags);
+static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flags, bool stream_locked);
 static char *idydb_get_err_message(idydb **handler);
 static unsigned char idydb_read_at(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position);
 static void idydb_clear_values(idydb **handler);
 static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position);
+static unsigned char idydb_insert_at_inplace(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position);
 static unsigned char idydb_insert_value_int(idydb **handler, int set_value);
 static unsigned char idydb_insert_value_float(idydb **handler, float set_value);
 static unsigned char idydb_insert_value_char(idydb **handler, char *set_value);
@@ -128,9 +188,7 @@ static bool idydb_retrieve_value_bool(idydb **handler);
 static const float* idydb_retrieve_value_vector(idydb **handler, unsigned short* out_dims);
 static unsigned char idydb_retrieve_value_type(idydb **handler);
 static void idydb_error_state(idydb **handler, unsigned char error_id);
-
-union idydb_read_mmap_response;
-static union idydb_read_mmap_response idydb_read_mmap(unsigned int position, unsigned char size, void *mmapped_char);
+static unsigned char idydb_validate_structure(idydb **handler);
 
 /* ----- constants and layout helpers ----- */
 #define IDYDB_MAX_BUFFER_SIZE 1024
@@ -159,12 +217,12 @@ static union idydb_read_mmap_response idydb_read_mmap(unsigned int position, uns
 #define IDYDB_COLUMN_POSITION_MAX 0x000F
 #define IDYDB_ROW_POSITION_MAX 0x000F
 typedef unsigned int idydb_size_selection_type;
-typedef unsigned short idydb_sizing_max;
+typedef uint64_t idydb_sizing_max;
 #elif IDYDB_SIZING_MODE == IDYDB_SIZING_MODE_SMALL
 #define IDYDB_COLUMN_POSITION_MAX 0x00FF
 #define IDYDB_ROW_POSITION_MAX 0x00FF
 typedef unsigned int idydb_size_selection_type;
-typedef unsigned int idydb_sizing_max;
+typedef uint64_t idydb_sizing_max;
 #elif IDYDB_SIZING_MODE == IDYDB_SIZING_MODE_BIG
 #define IDYDB_COLUMN_POSITION_MAX 0xFFFF
 #define IDYDB_ROW_POSITION_MAX 0xFFFF
@@ -239,9 +297,11 @@ static int idydb_crypto_derive_key_pbkdf2(const char* passphrase,
 {
 	if (!passphrase || !out_key || iter == 0) return 0;
 	if (!idydb_crypto_iter_ok(iter)) return 0;
+	size_t passphrase_len = strlen(passphrase);
+	if (passphrase_len > INT_MAX) return 0;
 
 	int ok = PKCS5_PBKDF2_HMAC(passphrase,
-	                          (int)strlen(passphrase),
+	                          (int)passphrase_len,
 	                          salt,
 	                          IDYDB_ENC_SALT_LEN,
 	                          (int)iter,
@@ -340,7 +400,7 @@ static FILE* idydb_secure_plain_stream(const char** out_kind)
         int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd < 0) return NULL;
 
-        (void)shm_unlink(name);
+		if (shm_unlink(name) != 0) { close(fd); return NULL; }
 
         FILE* f = fdopen(fd, "w+b");
         if (!f) { close(fd); return NULL; }
@@ -360,10 +420,10 @@ static int idydb_crypto_decrypt_locked_file_to_stream(FILE* in,
 	if (!in || !passphrase || !out_plain || !out_salt || !out_iter || !out_key) return 0;
 
 	/* Get total size for sanity checks. */
-	fseek(in, 0L, SEEK_END);
+	if (fseek(in, 0L, SEEK_END) != 0) return 0;
 	long long total_sz = ftell(in);
 	if (total_sz < 0) return 0;
-	fseek(in, 0L, SEEK_SET);
+	if (fseek(in, 0L, SEEK_SET) != 0) return 0;
 
 	if (total_sz < (long long)IDYDB_ENC_HDR_LEN) return 0;
 
@@ -407,7 +467,7 @@ static int idydb_crypto_decrypt_locked_file_to_stream(FILE* in,
 
 	if (ok && EVP_DecryptUpdate(ctx, NULL, &len, hdr, (int)IDYDB_ENC_AAD_LEN) != 1) ok = 0;
 
-	fseek(in, IDYDB_ENC_HDR_LEN, SEEK_SET);
+	if (fseek(in, IDYDB_ENC_HDR_LEN, SEEK_SET) != 0) { EVP_CIPHER_CTX_free(ctx); return 0; }
 
 	unsigned char inbuf[16 * 1024];
 	unsigned char outbuf[16 * 1024 + 16];
@@ -434,10 +494,8 @@ static int idydb_crypto_decrypt_locked_file_to_stream(FILE* in,
 
 	EVP_CIPHER_CTX_free(ctx);
 
-	if (ok && plaintext_len != written) ok = 0;
-
-	fflush(out_plain);
-	fseek(out_plain, 0L, SEEK_SET);
+	if (ok && (plaintext_len != written || ferror(in))) ok = 0;
+	if (fflush(out_plain) != 0 || fseek(out_plain, 0L, SEEK_SET) != 0) ok = 0;
 	return ok ? 1 : 0;
 }
 
@@ -450,14 +508,15 @@ static int idydb_crypto_encrypt_stream_to_locked_file(FILE* plain,
 	if (!plain || !out || !salt || !key || iter == 0) return 0;
 	if (!idydb_crypto_iter_ok(iter)) return 0;
 
-	fflush(plain);
+	if (fflush(plain) != 0) return 0;
+	clearerr(plain); /* Retry a transient read failure against the unchanged working image. */
 	long long cur = ftell(plain);
 	if (cur < 0) cur = 0;
-	fseek(plain, 0L, SEEK_END);
+	if (fseek(plain, 0L, SEEK_END) != 0) return 0;
 	long long plen_long = ftell(plain);
 	if (plen_long < 0) return 0;
 	uint64_t plaintext_len = (uint64_t)plen_long;
-	fseek(plain, 0L, SEEK_SET);
+	if (fseek(plain, 0L, SEEK_SET) != 0) return 0;
 
 	unsigned char iv[IDYDB_ENC_IV_LEN];
 	if (RAND_bytes(iv, IDYDB_ENC_IV_LEN) != 1) return 0;
@@ -473,10 +532,10 @@ static int idydb_crypto_encrypt_stream_to_locked_file(FILE* plain,
 	/* tag placeholder at hdr+52..+67 remains zero */
 
 	/* truncate & write placeholder header */
-	fflush(out);
+	if (fflush(out) != 0) return 0;
 	if (ftruncate(fileno(out), 0) != 0) return 0;
 
-	fseek(out, 0L, SEEK_SET);
+	if (fseek(out, 0L, SEEK_SET) != 0) return 0;
 	if (fwrite(hdr, 1, IDYDB_ENC_HDR_LEN, out) != IDYDB_ENC_HDR_LEN) return 0;
 
 	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
@@ -493,7 +552,7 @@ static int idydb_crypto_encrypt_stream_to_locked_file(FILE* plain,
 
 	unsigned char inbuf[16 * 1024];
 	unsigned char outbuf[16 * 1024 + 16];
-
+	uint64_t encrypted_bytes = 0;
 	while (ok) {
 		size_t n = fread(inbuf, 1, sizeof(inbuf), plain);
 		if (n == 0) break;
@@ -501,6 +560,7 @@ static int idydb_crypto_encrypt_stream_to_locked_file(FILE* plain,
 		if (EVP_EncryptUpdate(ctx, outbuf, &outl, inbuf, (int)n) != 1) { ok = 0; break; }
 		if (outl > 0) {
 			if (fwrite(outbuf, 1, (size_t)outl, out) != (size_t)outl) { ok = 0; break; }
+			encrypted_bytes += (uint64_t)outl;
 		}
 	}
 
@@ -517,17 +577,15 @@ static int idydb_crypto_encrypt_stream_to_locked_file(FILE* plain,
 
 	EVP_CIPHER_CTX_free(ctx);
 
-	if (!ok) return 0;
+	if (!ok || ferror(plain) || encrypted_bytes != plaintext_len) return 0;
 
 	/* write tag into header */
-	fseek(out, 52, SEEK_SET);
+	if (fseek(out, 52, SEEK_SET) != 0) return 0;
 	if (fwrite(tag, 1, IDYDB_ENC_TAG_LEN, out) != IDYDB_ENC_TAG_LEN) return 0;
 
-	fflush(out);
-	fsync(fileno(out));
+	if (fflush(out) != 0 || fsync(fileno(out)) != 0) return 0;
 
-	fseek(plain, cur, SEEK_SET);
-	return 1;
+	return fseek(plain, cur, SEEK_SET) == 0;
 }
 
 /* --------------------------- Core object --------------------------- */
@@ -567,9 +625,11 @@ typedef struct idydb
 	/* encryption runtime state */
 	bool encryption_enabled;
 	bool dirty;
+	bool mutation_staging; /* private clones may mutate in place, never the backing file */
 
 	FILE* backing_descriptor; /* locked file handle for encrypted backing (or NULL) */
 	char* backing_filename;
+	int directory_fd; /* owned POSIX directory anchor, -1 for pathname opens */
 
 	unsigned char enc_salt[IDYDB_ENC_SALT_LEN];
 	uint32_t enc_iter;
@@ -580,6 +640,152 @@ typedef struct idydb
 	const char* plain_storage_kind; /* "memfd" / "shm" / NULL */
 
 } idydb;
+
+/* All backing-file commits use a locked sibling file and atomic replacement. */
+static FILE* idydb_stage_file(idydb* h, char** out_path)
+{
+    *out_path = NULL;
+    if (!h->backing_filename) return NULL;
+    size_t length = strlen(h->backing_filename);
+    char* path = (char*)malloc(length + 40);
+    if (!path) return NULL;
+    FILE* stream = NULL;
+    bool created = false;
+#if defined(_WIN32)
+    unsigned char nonce[8];
+    if (RAND_bytes(nonce, sizeof(nonce)) != 1) { free(path); return NULL; }
+    snprintf(path, length + 40, "%s.tmp.%02x%02x%02x%02x%02x%02x%02x%02x",
+        h->backing_filename, nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
+    HANDLE win = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (win != INVALID_HANDLE_VALUE) {
+        created = true;
+        int fd = _open_osfhandle((intptr_t)win, _O_RDWR | _O_BINARY);
+        if (fd >= 0) { stream = fdopen(fd, "w+b"); if (!stream) _close(fd); }
+        else CloseHandle(win);
+    }
+#else
+    int fd = -1;
+    if (h->directory_fd >= 0) {
+        for (unsigned attempt = 0; attempt < 8; ++attempt) {
+            unsigned char nonce[8];
+            if (RAND_bytes(nonce, sizeof(nonce)) != 1) break;
+            snprintf(path, length + 40, ".idydb.tmp.%02x%02x%02x%02x%02x%02x%02x%02x",
+                nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
+            fd = openat(h->directory_fd, path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+            if (fd >= 0 || errno != EEXIST) break;
+        }
+    } else {
+        snprintf(path, length + 40, "%s.tmp.XXXXXX", h->backing_filename);
+        fd = mkstemp(path);
+    }
+    if (fd >= 0) {
+        created = true;
+        struct stat original;
+        FILE* backing = h->encryption_enabled ? h->backing_descriptor : h->file_descriptor;
+        if (fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && backing && fstat(fileno(backing), &original) == 0 &&
+            fchown(fd, original.st_uid, original.st_gid) == 0 &&
+            fchmod(fd, original.st_mode & 0777) == 0) stream = fdopen(fd, "w+b");
+        if (!stream) close(fd);
+    }
+#endif
+    if (stream && flock(fileno(stream), LOCK_EX | LOCK_NB) == 0) {
+        *out_path = path;
+        return stream;
+    }
+    if (stream) fclose(stream);
+    if (created) {
+#if defined(_WIN32)
+        DeleteFileA(path);
+#else
+        if (h->directory_fd >= 0) unlinkat(h->directory_fd, path, 0);
+        else unlink(path);
+#endif
+    }
+    free(path);
+    return NULL;
+}
+
+static void idydb_stage_cleanup(FILE* stream, char* path, int directory_fd)
+{
+    if (stream) fclose(stream);
+    if (path) {
+#if defined(_WIN32)
+        (void)directory_fd;
+        DeleteFileA(path);
+#else
+        if (directory_fd >= 0) unlinkat(directory_fd, path, 0);
+        else unlink(path);
+#endif
+        free(path);
+    }
+}
+
+static int idydb_sync_directory(const char* filename, int directory_fd)
+{
+#if defined(_WIN32)
+    (void)filename;
+    (void)directory_fd;
+    return IDYDB_FAULT(IDYDB_TEST_DIRECTORY_SYNC) == 0;
+#else
+    if (directory_fd >= 0) return IDYDB_FAULT(IDYDB_TEST_DIRECTORY_SYNC) == 0 && fsync(directory_fd) == 0;
+    char* parent = (char*)malloc(strlen(filename) + 1);
+    if (!parent) return 0;
+    strcpy(parent, filename);
+    char* slash = strrchr(parent, '/');
+    if (slash) { if (slash == parent) slash[1] = '\0'; else *slash = '\0'; }
+    int fd = open(slash ? parent : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    free(parent);
+    if (fd < 0) return 0;
+    int ok = IDYDB_FAULT(IDYDB_TEST_DIRECTORY_SYNC) == 0 && fsync(fd) == 0;
+    close(fd);
+    return ok;
+#endif
+}
+
+/* Once renamed, adopt the new locked inode even when directory sync fails.
+ * The caller can distinguish adoption because *staged is set to NULL. */
+static int idydb_publish(idydb* h, FILE** staged, const char* path, idydb_sizing_max size)
+{
+    if (IDYDB_FAULT(IDYDB_TEST_BEFORE_REPLACE) || IDYDB_FAULT(IDYDB_TEST_REPLACE)) return 0;
+#if defined(_WIN32)
+    if (!MoveFileExA(path, h->backing_filename, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+#else
+    if (h->directory_fd >= 0) {
+        struct stat opened, current;
+        FILE* backing = h->encryption_enabled ? h->backing_descriptor : h->file_descriptor;
+        if (fstat(fileno(backing), &opened) != 0 ||
+            fstatat(h->directory_fd, h->backing_filename, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(current.st_mode) || opened.st_dev != current.st_dev || opened.st_ino != current.st_ino) {
+            errno = ESTALE;
+            return 0;
+        }
+        if (renameat(h->directory_fd, path, h->directory_fd, h->backing_filename) != 0) return 0;
+    } else if (rename(path, h->backing_filename) != 0) return 0;
+#endif
+    FILE** destination = h->encryption_enabled ? &h->backing_descriptor : &h->file_descriptor;
+    FILE* previous = *destination;
+    *destination = *staged;
+    *staged = NULL;
+    if (!h->encryption_enabled) h->size = size;
+    fclose(previous);
+    if (IDYDB_FAULT(IDYDB_TEST_AFTER_REPLACE)) return 0;
+    return idydb_sync_directory(h->backing_filename, h->directory_fd);
+}
+
+static int idydb_crypto_commit(idydb* h)
+{
+    char* path = NULL;
+    FILE* staged = idydb_stage_file(h, &path);
+    if (!staged) return 0;
+    int ok = idydb_crypto_encrypt_stream_to_locked_file(h->file_descriptor, staged,
+        h->enc_salt, h->enc_iter, h->enc_key);
+    if (ok) ok = idydb_publish(h, &staged, path, h->size);
+    if (staged) idydb_stage_cleanup(staged, path, h->directory_fd);
+    else free(path); /* replacement already owns the complete file */
+    return ok;
+}
 
 /* ---------------- Verbose debug (compile-time) ---------------- */
 
@@ -681,6 +887,7 @@ static void idydb_dbg_format_value_from_handler(const idydb* h, char* out, size_
 {
 	if (!out || cap == 0) return;
 	if (!h) { snprintf(out, cap, "<nohandler>"); return; }
+	if (h->encryption_enabled) { snprintf(out, cap, "<encrypted value>"); return; }
 
 	switch (h->value_type)
 	{
@@ -789,6 +996,7 @@ static void idydb_error_statef(idydb **handler, unsigned char error_id, const ch
 }
 static void idydb_error_state(idydb **handler, unsigned char error_id)
 {
+	if (!handler || !*handler) return;
 	const char *errors[] = {
 		"\0",
 		"The minimum buffer size has encroached beyond suitable definitions\0",
@@ -834,28 +1042,6 @@ static void idydb_error_state(idydb **handler, unsigned char error_id)
 	snprintf((*handler)->err_message, IDYDB_MAX_ERR_SIZE, "%s", errors[error_id]);
 }
 
-/* ---------------- mmap helper ---------------- */
-
-#ifdef IDYDB_MMAP_OK
-union idydb_read_mmap_response
-{
-	int integer;
-	short short_integer;
-	float floating_point;
-	unsigned char bytes[4];
-};
-
-static union idydb_read_mmap_response idydb_read_mmap(unsigned int position, unsigned char size, void *mmapped_char)
-{
-	union idydb_read_mmap_response value;
-	memset(value.bytes, 0, sizeof(value.bytes));
-	unsigned char byte_position = 0;
-	for (unsigned int i = position; i < (size + position); i++)
-		value.bytes[byte_position++] = (char)(((char *)mmapped_char)[i]);
-	return value;
-}
-#endif
-
 /* ---------------- core helpers ---------------- */
 
 unsigned int idydb_version_check()
@@ -890,6 +1076,7 @@ static int idydb_new(idydb **handler)
 	(*handler)->unsafe = false;
 #endif
 	(*handler)->value_type = 0;
+	memset(&(*handler)->value, 0, sizeof((*handler)->value));
 	(*handler)->value_retrieved = false;
 	(*handler)->file_descriptor = NULL;
 	(*handler)->vector_value = NULL;
@@ -899,8 +1086,10 @@ static int idydb_new(idydb **handler)
 
 	(*handler)->encryption_enabled = false;
 	(*handler)->dirty = false;
+	(*handler)->mutation_staging = false;
 	(*handler)->backing_descriptor = NULL;
 	(*handler)->backing_filename = NULL;
+	(*handler)->directory_fd = -1;
 	memset((*handler)->enc_salt, 0, sizeof((*handler)->enc_salt));
 	(*handler)->enc_iter = 0;
 	memset((*handler)->enc_key, 0, sizeof((*handler)->enc_key));
@@ -932,15 +1121,12 @@ static void idydb_destroy(idydb **handler)
 {
 	if (!handler || !*handler) return;
 
-	if ((*handler)->configured)
+	(*handler)->configured = false;
+	if ((*handler)->file_descriptor != NULL)
 	{
-		(*handler)->configured = false;
-		if ((*handler)->file_descriptor != NULL)
-		{
 			flock(fileno((*handler)->file_descriptor), LOCK_UN);
 			fclose((*handler)->file_descriptor);
 			(*handler)->file_descriptor = NULL;
-		}
 	}
 
 	if ((*handler)->backing_descriptor != NULL)
@@ -954,10 +1140,17 @@ static void idydb_destroy(idydb **handler)
 		free((*handler)->backing_filename);
 		(*handler)->backing_filename = NULL;
 	}
-	if ((*handler)->enc_key_set)
+#if !defined(_WIN32)
+	if ((*handler)->directory_fd >= 0) {
+		close((*handler)->directory_fd);
+		(*handler)->directory_fd = -1;
+	}
+#endif
 	{
 		OPENSSL_cleanse((*handler)->enc_key, sizeof((*handler)->enc_key));
 		(*handler)->enc_key_set = false;
+		(*handler)->dirty = false;
+		(*handler)->encryption_enabled = false;
 	}
 
 	/* buffer teardown (malloc vs mmap) */
@@ -992,22 +1185,16 @@ static void idydb_destroy(idydb **handler)
 	}
 }
 
-static inline const idydb_sizing_max idydb_max_size()
+static inline idydb_sizing_max idydb_max_size()
 {
-	idydb_sizing_max insertion_area[2] = {0, 0};
-	insertion_area[0] = IDYDB_COLUMN_POSITION_MAX;
-	insertion_area[0] *= IDYDB_ROW_POSITION_MAX;
-	insertion_area[0] *= (IDYDB_MAX_CHAR_LENGTH - 1);
-	if (IDYDB_ROW_POSITION_MAX > 1)
-	{
-		insertion_area[1] = IDYDB_COLUMN_POSITION_MAX;
-		insertion_area[1] *= IDYDB_ROW_POSITION_MAX;
-		insertion_area[1] *= IDYDB_SEGMENT_SIZE;
-	}
-	return (insertion_area[0] + insertion_area[1] + (IDYDB_COLUMN_POSITION_MAX * IDYDB_PARTITION_AND_SEGMENT));
+	const uint64_t columns = (uint64_t)IDYDB_COLUMN_POSITION_MAX + 1;
+	const uint64_t rows = (uint64_t)IDYDB_ROW_POSITION_MAX + 1;
+	/* Maximum CHAR payload includes its NUL and uint16 length field. */
+	const uint64_t cell_bytes = IDYDB_SEGMENT_SIZE + IDYDB_MAX_CHAR_LENGTH + sizeof(short);
+	return (idydb_sizing_max)(columns * (IDYDB_PARTITION_SIZE + rows * cell_bytes));
 }
 
-static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flags)
+static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flags, bool stream_locked)
 {
 	if ((*handler)->configured)
 	{
@@ -1028,14 +1215,16 @@ static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flag
 		return IDYDB_PERM;
 	}
 
-	fseek((*handler)->file_descriptor, 0L, SEEK_END);
-	(*handler)->size = (idydb_sizing_max)ftell((*handler)->file_descriptor);
-	fseek((*handler)->file_descriptor, 0L, SEEK_SET);
+	if (fseek(stream, 0L, SEEK_END) != 0) return IDYDB_ERROR;
+	long long stream_size = ftell(stream);
+	if (stream_size < 0 || (uint64_t)stream_size > (uint64_t)((idydb_sizing_max)-1)) return IDYDB_RANGE;
+	(*handler)->size = (idydb_sizing_max)stream_size;
+	if (fseek(stream, 0L, SEEK_SET) != 0) return IDYDB_ERROR;
 
 	(*handler)->configured = true;
 
 	int op = LOCK_NB | (((flags & IDYDB_READONLY) == IDYDB_READONLY) ? LOCK_SH : LOCK_EX);
-	if (flock(fileno((*handler)->file_descriptor), op) != 0)
+	if (!stream_locked && flock(fileno((*handler)->file_descriptor), op) != 0)
 	{
 		idydb_error_state(handler, 6);
 		return IDYDB_BUSY;
@@ -1056,6 +1245,8 @@ static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flag
 		return IDYDB_RANGE;
 	}
 
+	unsigned char validation = idydb_validate_structure(handler);
+	if (validation != IDYDB_DONE) return validation;
 	(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
 	if ((*handler)->buffer == NULL)
 	{
@@ -1065,143 +1256,125 @@ static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flag
 	return IDYDB_SUCCESS;
 }
 
+/* Do not truncate on create. Verify pathname identity after acquiring the lock,
+ * so a caller never writes an old inode after another handle replaces the file. */
+static FILE* idydb_open_locked(const char* filename, int flags, int* status, int directory_fd = -1)
+{
+    const bool ro = ((flags & IDYDB_READONLY) == IDYDB_READONLY);
+    const bool create = !ro && ((flags & IDYDB_CREATE) == IDYDB_CREATE);
+    *status = IDYDB_ERROR;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+#if defined(_WIN32)
+        (void)directory_fd;
+        HANDLE win = CreateFileA(filename, ro ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            create ? OPEN_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (win == INVALID_HANDLE_VALUE) {
+            *status = GetLastError() == ERROR_FILE_NOT_FOUND ? IDYDB_NOT_FOUND : IDYDB_PERM;
+            return NULL;
+        }
+        int fd = _open_osfhandle((intptr_t)win, (ro ? _O_RDONLY : _O_RDWR) | _O_BINARY);
+        if (fd < 0) { CloseHandle(win); return NULL; }
+#else
+        int mode = (ro ? O_RDONLY : O_RDWR) | (create ? O_CREAT : 0) | O_CLOEXEC;
+        int fd = directory_fd >= 0 ? openat(directory_fd, filename, mode | O_NOFOLLOW | O_NONBLOCK, 0600) :
+            open(filename, mode, 0600);
+        if (fd < 0) { *status = errno == ENOENT ? IDYDB_NOT_FOUND : IDYDB_PERM; return NULL; }
+        struct stat metadata;
+        if (directory_fd >= 0 && (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode))) {
+            close(fd); *status = IDYDB_CORRUPT; return NULL;
+        }
+#endif
+        FILE* stream = fdopen(fd, ro ? "rb" : "r+b");
+        if (!stream) {
+#if defined(_WIN32)
+            _close(fd);
+#else
+            close(fd);
+#endif
+            return NULL;
+        }
+        if (flock(fd, LOCK_NB | (ro ? LOCK_SH : LOCK_EX)) != 0) {
+            fclose(stream); *status = IDYDB_BUSY; return NULL;
+        }
+        bool same = false;
+#if defined(_WIN32)
+        BY_HANDLE_FILE_INFORMATION opened, current;
+        HANDLE path = CreateFileA(filename, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (path != INVALID_HANDLE_VALUE) {
+            same = GetFileInformationByHandle(win, &opened) && GetFileInformationByHandle(path, &current)
+                && opened.dwVolumeSerialNumber == current.dwVolumeSerialNumber
+                && opened.nFileIndexHigh == current.nFileIndexHigh
+                && opened.nFileIndexLow == current.nFileIndexLow;
+            CloseHandle(path);
+        }
+#else
+        struct stat opened, current;
+        int path_status = directory_fd >= 0 ? fstatat(directory_fd, filename, &current, AT_SYMLINK_NOFOLLOW) :
+            stat(filename, &current);
+        same = fstat(fd, &opened) == 0 && path_status == 0
+            && opened.st_dev == current.st_dev && opened.st_ino == current.st_ino;
+#endif
+        if (same) { *status = IDYDB_SUCCESS; return stream; }
+        fclose(stream);
+    }
+    *status = IDYDB_BUSY;
+    return NULL;
+}
+
 static int idydb_connection_setup(idydb **handler, const char *filename, int flags)
 {
-	if ((*handler)->configured)
-	{
-		if (IDYDB_MAX_BUFFER_SIZE >= 50 && IDYDB_MAX_BUFFER_SIZE <= 1024)
-			idydb_error_state(handler, 3);
-		return IDYDB_ERROR;
-	}
-	(*handler)->size = 0;
-	(*handler)->read_only = IDYDB_READ_AND_WRITE;
-	if ((flags & IDYDB_READONLY) == IDYDB_READONLY)
-		(*handler)->read_only = IDYDB_READONLY;
-
-	bool file_exists = true;
-	if (access(filename, F_OK) != 0)
-	{
-		file_exists = false;
-		if ((*handler)->read_only == IDYDB_READONLY)
-		{
-			if ((flags & IDYDB_CREATE) == 0)
-			{
-				idydb_error_state(handler, 4);
-				return IDYDB_NOT_FOUND;
-			}
-		}
-	}
-
-	const char* mode =
-		(((flags & IDYDB_READONLY) == IDYDB_READONLY)
-			? "rb"
-			: ((((flags & IDYDB_CREATE) == IDYDB_CREATE) && !file_exists) ? "w+b" : "r+b"));
-	(*handler)->file_descriptor = fopen(filename, mode);
-
-	if ((*handler)->file_descriptor == NULL)
-	{
-		idydb_error_state(handler, 5);
-		return IDYDB_PERM;
-	}
-	else
-	{
-		fseek((*handler)->file_descriptor, 0L, SEEK_END);
-		(*handler)->size = ftell((*handler)->file_descriptor);
-		fseek((*handler)->file_descriptor, 0L, SEEK_SET);
-	}
-
-	(*handler)->configured = true;
-
-	int op = LOCK_NB | (((flags & IDYDB_READONLY) == IDYDB_READONLY) ? LOCK_SH : LOCK_EX);
-	if (flock(fileno((*handler)->file_descriptor), op) != 0)
-	{
-		idydb_error_state(handler, 6);
-		return IDYDB_BUSY;
-	}
-
-	if ((flags & IDYDB_UNSAFE) == IDYDB_UNSAFE)
-#ifdef IDYDB_ALLOW_UNSAFE
-		(*handler)->unsafe = true;
-#else
-	{
-		idydb_error_state(handler, 23);
-		return IDYDB_ERROR;
-	}
-#endif
-	else if ((*handler)->size > idydb_max_size())
-	{
-		idydb_error_state(handler, 7);
-		return IDYDB_RANGE;
-	}
-
-#ifdef IDYDB_MMAP_OK
-	if ((*handler)->read_only == IDYDB_READONLY)
-	{
-		if ((*handler)->size <= IDYDB_MMAP_MAX_SIZE && (*handler)->size > 0)
-		{
+    int status;
+    FILE* stream = idydb_open_locked(filename, flags, &status);
+    if (!stream) {
+        idydb_error_state(handler, status == IDYDB_BUSY ? 6 : (status == IDYDB_NOT_FOUND ? 4 : 5));
+        return status;
+    }
+    int rc = idydb_connection_setup_stream(handler, stream, flags, true);
+    if (rc != IDYDB_SUCCESS) return rc;
+    if ((*handler)->read_only == IDYDB_READ_AND_WRITE) {
 #if defined(_WIN32)
-			HANDLE hFile = (HANDLE)_get_osfhandle(fileno((*handler)->file_descriptor));
-			if (hFile != INVALID_HANDLE_VALUE)
-			{
-				HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-				if (hMap)
-				{
-					void* view = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-					if (view)
-					{
-						(*handler)->buffer = view;
-						(*handler)->win32_mmap_handle = hMap;
-						(*handler)->read_only = IDYDB_READONLY_MMAPPED;
-					}
-					else
-					{
-						CloseHandle(hMap);
-						(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-					}
-				}
-				else
-				{
-					(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-				}
-			}
-			else
-			{
-				(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-			}
+    (*handler)->backing_filename = _fullpath(NULL, filename, 0);
 #else
-			(*handler)->buffer = mmap(NULL, (*handler)->size, PROT_READ, MAP_PRIVATE, fileno((*handler)->file_descriptor), 0);
-			if ((*handler)->buffer != MAP_FAILED)
-				(*handler)->read_only = IDYDB_READONLY_MMAPPED;
-			else
-				(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
+    (*handler)->backing_filename = realpath(filename, NULL);
 #endif
-		}
-		else
-			(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-	}
-	else
+    if (!(*handler)->backing_filename) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+    }
+#ifdef IDYDB_MMAP_OK
+    if ((*handler)->read_only == IDYDB_READONLY && (*handler)->size > 0
+        && (*handler)->size <= IDYDB_MMAP_MAX_SIZE) {
+#if defined(_WIN32)
+        HANDLE win = (HANDLE)_get_osfhandle(fileno(stream));
+        HANDLE mapping = CreateFileMappingW(win, NULL, PAGE_READONLY, 0, 0, NULL);
+        void* view = mapping ? MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) : NULL;
+        if (view) {
+            free((*handler)->buffer); (*handler)->buffer = view;
+            (*handler)->win32_mmap_handle = mapping;
+            (*handler)->read_only = IDYDB_READONLY_MMAPPED;
+        } else if (mapping) CloseHandle(mapping);
+#else
+        void* view = mmap(NULL, (size_t)(*handler)->size, PROT_READ, MAP_PRIVATE, fileno(stream), 0);
+        if (view != MAP_FAILED) {
+            free((*handler)->buffer); (*handler)->buffer = view;
+            (*handler)->read_only = IDYDB_READONLY_MMAPPED;
+        }
 #endif
-		(*handler)->buffer = malloc((sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-
-	if ((*handler)->buffer == NULL)
-	{
-		idydb_error_state(handler, 24);
-		return IDYDB_ERROR;
-	}
-
-	return IDYDB_SUCCESS;
+    }
+#endif
+    return IDYDB_SUCCESS;
 }
 
 static char *idydb_get_err_message(idydb **handler)
 {
-	if (*handler == NULL)
+	if (!handler || *handler == NULL)
 		return (char *)"This handler failed to be setup\0";
 	return (*handler)->err_message;
 }
 
 /* ---------------- Public open/close (runtime encryption) ---------------- */
 
-int idydb_open_with_options(const char *filename, idydb **handler, const idydb_open_options* options)
+static int idydb_open_internal(const char *filename, idydb **handler, const idydb_open_options* options)
 {
 	if (!filename || !handler || !options) return IDYDB_ERROR;
 
@@ -1228,7 +1401,7 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 	/* encrypted-at-rest path */
 	if (!options->passphrase)
 	{
-		idydb_error_state(handler, 27);
+		idydb_error_state(handler, 26);
 		DB_DEBUGF(handler, "encrypted open refused: passphrase is NULL (file=\"%s\")", filename);
 		return IDYDB_ERROR;
 	}
@@ -1243,34 +1416,30 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 	/* open + lock backing file */
 	const bool ro = ((flags & IDYDB_READONLY) == IDYDB_READONLY);
 
-	FILE* backing = fopen(filename,
-		(ro ? "rb" : (file_exists ? "rb+" : "wb+")));
-
-	if (!backing)
-	{
-		idydb_error_state(handler, 5);
-		return IDYDB_PERM;
-	}
-
-	int op = LOCK_NB | (ro ? LOCK_SH : LOCK_EX);
-	if (flock(fileno(backing), op) != 0)
-	{
-		fclose(backing);
-		idydb_error_state(handler, 6);
-		return IDYDB_BUSY;
+	int backing_status;
+	FILE* backing = idydb_open_locked(filename, flags, &backing_status);
+	if (!backing) {
+		idydb_error_state(handler, backing_status == IDYDB_BUSY ? 6 : (backing_status == IDYDB_NOT_FOUND ? 4 : 5));
+		return backing_status;
 	}
 
 	(*handler)->encryption_enabled = true;
 	(*handler)->backing_descriptor = backing;
-	(*handler)->backing_filename = (char*)malloc(strlen(filename) + 1);
-	if ((*handler)->backing_filename) strcpy((*handler)->backing_filename, filename);
+	if (!ro) {
+#if defined(_WIN32)
+	(*handler)->backing_filename = _fullpath(NULL, filename, 0);
+#else
+	(*handler)->backing_filename = realpath(filename, NULL);
+#endif
+	if (!(*handler)->backing_filename) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+	}
 	(*handler)->dirty = false;
 
 	const char* kind = NULL;
 	FILE* plain = idydb_secure_plain_stream(&kind);
 	if (!plain)
 	{
-		idydb_error_state(handler, 30);
+		idydb_error_state(handler, 29);
 		DB_DEBUGF(handler, "failed to create secure in-memory plaintext working storage (backing=\"%s\")", filename);
 		return IDYDB_ERROR;
 	}
@@ -1280,23 +1449,25 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 	          filename, (ro ? "yes" : "no"), (file_exists ? "yes" : "no"), (kind ? kind : "unknown"));
 
 	/* detect encrypted header */
-	fseek(backing, 0L, SEEK_END);
+	if (fseek(backing, 0L, SEEK_END) != 0) { fclose(plain); return IDYDB_ERROR; }
 	long long bsz = ftell(backing);
-	fseek(backing, 0L, SEEK_SET);
+	if (bsz < 0 || fseek(backing, 0L, SEEK_SET) != 0) { fclose(plain); return IDYDB_ERROR; }
 
 	bool is_enc = false;
 	if (bsz >= (long)IDYDB_ENC_MAGIC_LEN)
 	{
 		unsigned char magic[IDYDB_ENC_MAGIC_LEN];
 		size_t rr = fread(magic, 1, IDYDB_ENC_MAGIC_LEN, backing);
-		fseek(backing, 0L, SEEK_SET);
+		if (rr != IDYDB_ENC_MAGIC_LEN || fseek(backing, 0L, SEEK_SET) != 0) {
+			fclose(plain); return IDYDB_ERROR;
+		}
 		if (rr == IDYDB_ENC_MAGIC_LEN && memcmp(magic, IDYDB_ENC_MAGIC, IDYDB_ENC_MAGIC_LEN) == 0) is_enc = true;
 	}
 
 	/* IMPORTANT: encrypted-at-rest should not silently accept a plaintext backing in READONLY mode */
 	if (!is_enc && ro && bsz > 0)
 	{
-		idydb_error_state(handler, 31);
+		idydb_error_state(handler, 30);
 		DB_DEBUGF(handler, "refusing encrypted READONLY open on PLAINTEXT backing; open writable once to migrate");
 		fclose(plain);
 		return IDYDB_ERROR;
@@ -1309,7 +1480,7 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 		if (!idydb_crypto_decrypt_locked_file_to_stream(backing, options->passphrase, plain,
 		                                                (*handler)->enc_salt, &iter, (*handler)->enc_key))
 		{
-			idydb_error_state(handler, 28);
+			idydb_error_state(handler, 27);
 			DB_DEBUGF(handler, "decrypt FAILED (wrong passphrase, tampered file, or unsupported params)");
 			fclose(plain);
 			return IDYDB_ERROR;
@@ -1317,10 +1488,10 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 		(*handler)->enc_iter = iter;
 		(*handler)->enc_key_set = true;
 
-		fseek(plain, 0L, SEEK_END);
-		long long psz = ftell(plain);
-		fseek(plain, 0L, SEEK_SET);
-		DB_DEBUGF(handler, "decrypt OK -> plaintext bytes=%ld pbkdf2_iter=%u", psz, iter);
+		if (fseek(plain, 0L, SEEK_END) != 0) { fclose(plain); return IDYDB_ERROR; }
+		[[maybe_unused]] long long psz = ftell(plain);
+		if (psz < 0 || fseek(plain, 0L, SEEK_SET) != 0) { fclose(plain); return IDYDB_ERROR; }
+		DB_DEBUGF(handler, "decrypt OK -> plaintext bytes=%lld pbkdf2_iter=%u", psz, iter);
 	}
 	else
 	{
@@ -1329,14 +1500,17 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 		{
 			DB_DEBUGF(handler, "PLAINTEXT backing detected; copying into working plaintext stream (migration)");
 			unsigned char buf[16 * 1024];
+			uint64_t copied = 0;
 			while (1) {
 				size_t n = fread(buf, 1, sizeof(buf), backing);
 				if (n == 0) break;
 				if (fwrite(buf, 1, n, plain) != n) { idydb_error_state(handler, 26); fclose(plain); return IDYDB_ERROR; }
+				copied += n;
 			}
-			fflush(plain);
-			fseek(plain, 0L, SEEK_SET);
-			fseek(backing, 0L, SEEK_SET);
+			if (ferror(backing) || copied != (uint64_t)bsz || fflush(plain) != 0 ||
+			    fseek(plain, 0L, SEEK_SET) != 0 || fseek(backing, 0L, SEEK_SET) != 0) {
+				fclose(plain); return IDYDB_ERROR;
+			}
 		}
 
 		/* generate new key/salt for migration or new encrypted creation */
@@ -1370,16 +1544,28 @@ int idydb_open_with_options(const char *filename, idydb **handler, const idydb_o
 	}
 
 	/* Setup db handler to operate on plaintext stream */
-	int setup_rc = idydb_connection_setup_stream(handler, plain, flags);
+	int setup_rc = idydb_connection_setup_stream(handler, plain, flags, false);
 	if (setup_rc != IDYDB_SUCCESS)
 	{
-		fclose(plain);
 		return setup_rc;
 	}
 
 	idydb_clear_values(handler);
 	DB_DEBUGF(handler, "ready: db opened against secure working plaintext stream kind=%s", (kind ? kind : "unknown"));
 	return IDYDB_SUCCESS;
+}
+
+int idydb_open_with_options(const char *filename, idydb **handler, const idydb_open_options* options)
+{
+	if (!filename || !*filename || !handler || !options) return IDYDB_ERROR;
+	if (*handler && (*handler)->configured) {
+		idydb_error_state(handler, 3);
+		return IDYDB_ERROR;
+	}
+	if (*handler) { idydb_destroy(handler); free(*handler); *handler = NULL; }
+	int rc = idydb_open_internal(filename, handler, options);
+	if (rc != IDYDB_SUCCESS) idydb_destroy(handler);
+	return rc;
 }
 
 int idydb_open(const char *filename, idydb **handler, int flags)
@@ -1392,6 +1578,50 @@ int idydb_open(const char *filename, idydb **handler, int flags)
 	return idydb_open_with_options(filename, handler, &opt);
 }
 
+int idydb_open_at(int directory_fd, const char* filename, idydb** handler, int flags)
+{
+#if defined(_WIN32)
+	(void)directory_fd; (void)filename; (void)flags;
+	idydb_error_statef(handler, 8, "Directory-relative access is unsupported on Windows");
+	return IDYDB_ERROR;
+#else
+	if (!handler || !filename || !*filename || strchr(filename, '/') ||
+	    strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0 ||
+	    (flags & ~(IDYDB_CREATE | IDYDB_READONLY | IDYDB_UNSAFE)) != 0 ||
+	    ((flags & IDYDB_CREATE) != 0 && (flags & IDYDB_CREATE) != IDYDB_CREATE)) return IDYDB_ERROR;
+	if (*handler && (*handler)->configured) { idydb_error_state(handler, 3); return IDYDB_ERROR; }
+	struct stat metadata;
+	if (directory_fd < 0 || fstat(directory_fd, &metadata) != 0 || !S_ISDIR(metadata.st_mode)) return IDYDB_ERROR;
+	const int directory_flags = fcntl(directory_fd, F_GETFL);
+	if (directory_flags < 0 || (directory_flags & O_ACCMODE) != O_RDONLY) return IDYDB_ERROR;
+#if defined(O_PATH)
+	/* O_PATH anchors support openat but cannot synchronize a published entry. */
+	if ((directory_flags & O_PATH) != 0) return IDYDB_ERROR;
+#endif
+	int owned_directory = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+	if (owned_directory < 0) return IDYDB_PERM;
+	if (*handler) { idydb_destroy(handler); free(*handler); *handler = NULL; }
+	if (idydb_new(handler) != IDYDB_SUCCESS) { close(owned_directory); return IDYDB_ERROR; }
+	(*handler)->directory_fd = owned_directory;
+	(*handler)->backing_filename = (char*)malloc(strlen(filename) + 1);
+	if (!(*handler)->backing_filename) {
+		idydb_error_state(handler, 24); idydb_destroy(handler); return IDYDB_ERROR;
+	}
+	strcpy((*handler)->backing_filename, filename);
+	int rc;
+	FILE* stream = idydb_open_locked(filename, flags, &rc, owned_directory);
+	if (!stream) {
+		idydb_error_state(handler, rc == IDYDB_BUSY ? 6 : (rc == IDYDB_NOT_FOUND ? 4 : 5));
+		idydb_destroy(handler);
+		return rc;
+	}
+	rc = idydb_connection_setup_stream(handler, stream, flags, true);
+	if (rc != IDYDB_SUCCESS) { idydb_destroy(handler); return rc; }
+	idydb_clear_values(handler);
+	return IDYDB_SUCCESS;
+#endif
+}
+
 int idydb_open_encrypted(const char *filename, idydb **handler, int flags, const char* passphrase)
 {
 	idydb_open_options opt;
@@ -1402,9 +1632,10 @@ int idydb_open_encrypted(const char *filename, idydb **handler, int flags, const
 	return idydb_open_with_options(filename, handler, &opt);
 }
 
-int idydb_close(idydb **handler)
+int idydb_flush(idydb **handler)
 {
-	if (!handler || !*handler) return IDYDB_DONE;
+	if (!handler || !*handler || !(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
+	if ((*handler)->read_only != IDYDB_READ_AND_WRITE) return IDYDB_DONE;
 
 	/* If encrypted-at-rest and dirty and writable, writeback ciphertext */
 	if ((*handler)->encryption_enabled &&
@@ -1413,40 +1644,236 @@ int idydb_close(idydb **handler)
 	    (*handler)->read_only == IDYDB_READ_AND_WRITE &&
 	    (*handler)->dirty)
 	{
-		DB_DEBUGF(handler, "close: encrypting writeback -> backing=\"%s\" pbkdf2_iter=%u",
+		DB_DEBUGF(handler, "flush: encrypting writeback -> backing=\"%s\" pbkdf2_iter=%u",
 		          ((*handler)->backing_filename ? (*handler)->backing_filename : "(unknown)"),
 		          (*handler)->enc_iter);
 
-		if (!idydb_crypto_encrypt_stream_to_locked_file((*handler)->file_descriptor,
-		                                                (*handler)->backing_descriptor,
-		                                                (*handler)->enc_salt,
-		                                                (*handler)->enc_iter,
-		                                                (*handler)->enc_key))
+		if (idydb_validate_structure(handler) != IDYDB_DONE || !idydb_crypto_commit(*handler))
 		{
-			idydb_error_state(handler, 29);
-			DB_DEBUGF(handler, "close: writeback FAILED (backing not updated safely)");
-			idydb_destroy(handler);
-			free(*handler);
-			*handler = NULL;
+			idydb_error_state(handler, 28);
+			DB_DEBUGF(handler, "flush: writeback or durability check failed; handle retained for retry");
 			return IDYDB_ERROR;
 		}
-		DB_DEBUGF(handler, "close: writeback OK");
+		DB_DEBUGF(handler, "flush: writeback OK");
+		(*handler)->dirty = false;
 	}
 	else
 	{
-		DB_DEBUGF(handler, "close: no writeback (enc=%s dirty=%s mode=%s)",
+		DB_DEBUGF(handler, "flush: no writeback (enc=%s dirty=%s mode=%s)",
 		          ((*handler)->encryption_enabled ? "yes" : "no"),
 		          ((*handler)->dirty ? "yes" : "no"),
 		          idydb_ro_str((*handler)->read_only));
 	}
 
+	if ((*handler)->configured && (*handler)->read_only == IDYDB_READ_AND_WRITE &&
+	    (fflush((*handler)->file_descriptor) != 0 || fsync(fileno((*handler)->file_descriptor)) != 0)) {
+		idydb_error_state(handler, 15);
+		return IDYDB_ERROR;
+	}
+	/* A previous publish may already be visible while its directory sync failed.
+	 * Retry that durability step even when there are no new plaintext changes. */
+	if (!(*handler)->encryption_enabled && !idydb_sync_directory((*handler)->backing_filename, (*handler)->directory_fd)) {
+		idydb_error_state(handler, 15);
+		return IDYDB_ERROR;
+	}
+	return IDYDB_DONE;
+}
+
+int idydb_discard(idydb **handler)
+{
+	if (!handler || !*handler) return IDYDB_DONE;
 	idydb_destroy(handler);
 	free(*handler);
 	*handler = NULL;
 	return IDYDB_DONE;
 }
 
+int idydb_close(idydb **handler)
+{
+	if (!handler || !*handler) return IDYDB_DONE;
+	if ((*handler)->configured) {
+		int rc = idydb_flush(handler);
+		if (rc != IDYDB_DONE) return rc;
+	}
+	return idydb_discard(handler);
+}
+
 /* ---------------- Public API thin wrappers ---------------- */
+
+/* One bounded decoder is shared by extraction, queries and mutation validation.
+ * Counts are wider than the on-disk count-minus-one field (65535 means 65536).
+ */
+struct idydb_scan_cursor {
+	idydb_sizing_max offset;
+	idydb_size_selection_type column;
+	uint32_t rows_remaining;
+	unsigned short last_row;
+	bool have_last_row;
+};
+
+struct idydb_record {
+	idydb_sizing_max offset;
+	idydb_sizing_max data_offset;
+	idydb_sizing_max payload_size;
+	idydb_sizing_max next_offset;
+	idydb_size_selection_type column;
+	idydb_column_row_sizing row;
+	unsigned char type;
+	unsigned short field;
+};
+
+static unsigned char idydb_read_bytes_at(idydb **handler, idydb_sizing_max position, void* out, size_t count)
+{
+	if (!handler || !*handler || !(*handler)->configured || (!out && count)) return IDYDB_ERROR;
+	if (position > (*handler)->size || count > (*handler)->size - position) {
+		idydb_error_state(handler, 13);
+		return IDYDB_CORRUPT;
+	}
+	if (!count) return IDYDB_DONE;
+#ifdef IDYDB_MMAP_OK
+	if ((*handler)->read_only == IDYDB_READONLY_MMAPPED) {
+		memcpy(out, (const unsigned char*)(*handler)->buffer + position, count);
+		return IDYDB_DONE;
+	}
+#endif
+	if (fseek((*handler)->file_descriptor, position, SEEK_SET) != 0 ||
+	    fread(out, 1, count, (*handler)->file_descriptor) != count) {
+		idydb_error_state(handler, 14);
+		return IDYDB_ERROR;
+	}
+	return IDYDB_DONE;
+}
+
+static unsigned char idydb_scan_next(idydb **handler, idydb_scan_cursor* cursor, idydb_record* record)
+{
+	if (!handler || !*handler || !(*handler)->configured || !cursor || !record) return IDYDB_ERROR;
+	if (cursor->offset == (*handler)->size && cursor->rows_remaining == 0) return IDYDB_NULL;
+	const bool partition = cursor->rows_remaining == 0;
+	const size_t header_size = partition ? IDYDB_PARTITION_AND_SEGMENT : IDYDB_SEGMENT_SIZE;
+	unsigned char header[IDYDB_PARTITION_AND_SEGMENT];
+	unsigned char rc = idydb_read_bytes_at(handler, cursor->offset, header, header_size);
+	if (rc != IDYDB_DONE) return rc;
+	unsigned short stored_row = 0;
+	if (partition) {
+		unsigned short skip = 0, count = 0;
+		memcpy(&skip, header, sizeof(skip));
+		memcpy(&count, header + sizeof(short), sizeof(count));
+		if (cursor->column > (idydb_size_selection_type)-1 - ((idydb_size_selection_type)skip + 1)) {
+			idydb_error_state(handler, 13); return IDYDB_CORRUPT;
+		}
+		cursor->column += (idydb_size_selection_type)skip + 1;
+		cursor->rows_remaining = (uint32_t)count + 1;
+		cursor->have_last_row = false;
+		if (cursor->rows_remaining > (uint32_t)IDYDB_ROW_POSITION_MAX + 1) {
+			idydb_error_state(handler, 22); return IDYDB_RANGE;
+		}
+#ifdef IDYDB_ALLOW_UNSAFE
+		if (!(*handler)->unsafe && cursor->column > (idydb_size_selection_type)IDYDB_COLUMN_POSITION_MAX + 1) {
+#else
+		if (cursor->column > (idydb_size_selection_type)IDYDB_COLUMN_POSITION_MAX + 1) {
+#endif
+			idydb_error_state(handler, 22); return IDYDB_RANGE;
+		}
+	}
+	const size_t row_offset = partition ? IDYDB_PARTITION_SIZE : 0;
+	memcpy(&stored_row, header + row_offset, sizeof(stored_row));
+	if (
+#if IDYDB_SIZING_MODE != IDYDB_SIZING_MODE_BIG
+	    stored_row > IDYDB_ROW_POSITION_MAX ||
+#endif
+	    (cursor->have_last_row && stored_row <= cursor->last_row)) {
+		idydb_error_state(handler, 13); return IDYDB_CORRUPT;
+	}
+	record->offset = cursor->offset;
+	record->column = cursor->column;
+	record->row = (idydb_column_row_sizing)stored_row + 1;
+	record->type = header[row_offset + sizeof(short)];
+	record->field = 0;
+	record->data_offset = cursor->offset + header_size;
+	switch (record->type) {
+		case IDYDB_READ_INT: record->payload_size = sizeof(int); break;
+		case IDYDB_READ_FLOAT: record->payload_size = sizeof(float); break;
+		case IDYDB_READ_BOOL_TRUE:
+		case IDYDB_READ_BOOL_FALSE: record->payload_size = 0; break;
+		case IDYDB_READ_CHAR:
+		case IDYDB_READ_VECTOR:
+			rc = idydb_read_bytes_at(handler, record->data_offset, &record->field, sizeof(short));
+			if (rc != IDYDB_DONE) return rc;
+			record->data_offset += sizeof(short);
+			if (record->type == IDYDB_READ_CHAR) {
+				if (record->field >= IDYDB_MAX_CHAR_LENGTH) {
+					idydb_error_state(handler, 19); return IDYDB_CORRUPT;
+				}
+				record->payload_size = (idydb_sizing_max)record->field + 1;
+			} else {
+				if (record->field == 0 || record->field > IDYDB_MAX_VECTOR_DIM) {
+					idydb_error_state(handler, 19); return IDYDB_CORRUPT;
+				}
+				record->payload_size = (idydb_sizing_max)record->field * sizeof(float);
+			}
+			break;
+		default: idydb_error_state(handler, 20); return IDYDB_CORRUPT;
+	}
+	if (record->data_offset > (*handler)->size || record->payload_size > (*handler)->size - record->data_offset) {
+		idydb_error_state(handler, 13); return IDYDB_CORRUPT;
+	}
+	if (record->type == IDYDB_READ_CHAR) {
+		unsigned char chunk[IDYDB_MAX_BUFFER_SIZE];
+		idydb_sizing_max checked = 0;
+		while (checked < record->payload_size) {
+			const size_t count = (size_t)((record->payload_size - checked < sizeof(chunk)) ? record->payload_size - checked : sizeof(chunk));
+			rc = idydb_read_bytes_at(handler, record->data_offset + checked, chunk, count);
+			if (rc != IDYDB_DONE) return rc;
+			for (size_t i = 0; i < count; ++i) {
+				const bool last = checked + i + 1 == record->payload_size;
+				if ((chunk[i] == 0) != last) { idydb_error_state(handler, 13); return IDYDB_CORRUPT; }
+			}
+			checked += count;
+		}
+	}
+	record->next_offset = record->data_offset + record->payload_size;
+	cursor->offset = record->next_offset;
+	cursor->last_row = stored_row;
+	cursor->have_last_row = true;
+	--cursor->rows_remaining;
+	return IDYDB_DONE;
+}
+
+static unsigned char idydb_validate_structure(idydb **handler)
+{
+	idydb_scan_cursor cursor = {};
+	idydb_record record = {};
+	unsigned char rc;
+	while ((rc = idydb_scan_next(handler, &cursor, &record)) == IDYDB_DONE) {}
+	return rc == IDYDB_NULL ? IDYDB_DONE : rc;
+}
+
+/* Unsafe mode can extend the column range, but each stored gap is still uint16.
+ * Reject changes that would truncate a new or merged gap before moving bytes.
+ */
+static unsigned char idydb_validate_column_gap(idydb **handler, idydb_column_row_sizing column, idydb_column_row_sizing row)
+{
+	idydb_scan_cursor cursor = {};
+	idydb_record record = {};
+	idydb_size_selection_type previous = 0, next = 0;
+	uint32_t rows = 0;
+	bool found_row = false;
+	unsigned char rc;
+	while ((rc = idydb_scan_next(handler, &cursor, &record)) == IDYDB_DONE) {
+		if (record.column < column) previous = record.column;
+		else if (record.column == column) { ++rows; if (record.row == row) found_row = true; }
+		else { next = record.column; break; }
+	}
+	if (rc != IDYDB_DONE && rc != IDYDB_NULL) return rc;
+	const bool inserting_column = rows == 0 && (*handler)->value_type != IDYDB_NULL;
+	const bool removing_column = rows == 1 && found_row && (*handler)->value_type == IDYDB_NULL;
+	if ((inserting_column && column - previous - 1 > 0xFFFF) ||
+	    (removing_column && next != 0 && next - previous - 1 > 0xFFFF)) {
+		idydb_error_state(handler, 12);
+		return IDYDB_RANGE;
+	}
+	return IDYDB_DONE;
+}
 
 char *idydb_errmsg(idydb **handler) { return idydb_get_err_message(handler); }
 int idydb_extract(idydb **handler, idydb_column_row_sizing c, idydb_column_row_sizing r) { return idydb_read_at(handler, c, r); }
@@ -1456,6 +1883,7 @@ int idydb_retrieved_type(idydb **handler) { return idydb_retrieve_value_type(han
 
 static unsigned char idydb_insert_value_int(idydb **handler, int set_value)
 {
+	if (!handler || !*handler) return IDYDB_ERROR;
 	if (!(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if ((*handler)->read_only != IDYDB_READ_AND_WRITE) { idydb_error_state(handler, 9); return IDYDB_READONLY; }
 	if ((*handler)->value_type != IDYDB_NULL && !(*handler)->value_retrieved) { idydb_error_state(handler, 10); return IDYDB_ERROR; }
@@ -1467,6 +1895,7 @@ static unsigned char idydb_insert_value_int(idydb **handler, int set_value)
 
 static unsigned char idydb_insert_value_float(idydb **handler, float set_value)
 {
+	if (!handler || !*handler) return IDYDB_ERROR;
 	if (!(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if ((*handler)->read_only != IDYDB_READ_AND_WRITE) { idydb_error_state(handler, 9); return IDYDB_READONLY; }
 	if ((*handler)->value_type != IDYDB_NULL && !(*handler)->value_retrieved) { idydb_error_state(handler, 10); return IDYDB_ERROR; }
@@ -1478,17 +1907,25 @@ static unsigned char idydb_insert_value_float(idydb **handler, float set_value)
 
 static unsigned char idydb_insert_value_char(idydb **handler, char *set_value)
 {
+	if (!handler || !*handler || !set_value) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if (!(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if ((*handler)->read_only != IDYDB_READ_AND_WRITE) { idydb_error_state(handler, 9); return IDYDB_READONLY; }
 	if ((*handler)->value_type != IDYDB_NULL && !(*handler)->value_retrieved) { idydb_error_state(handler, 10); return IDYDB_ERROR; }
+	/* The input may be the handler's most recently retrieved string. */
+	const size_t length = strlen(set_value);
+	char* copy = (char*)malloc(length + 1);
+	if (!copy) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+	memcpy(copy, set_value, length + 1);
 	idydb_clear_values(handler);
 	(*handler)->value_type = IDYDB_CHAR;
-	strncpy((*handler)->value.char_value, set_value, sizeof((*handler)->value.char_value));
+	memcpy((*handler)->value.char_value, copy, length + 1);
+	free(copy);
 	return IDYDB_DONE;
 }
 
 static unsigned char idydb_insert_value_bool(idydb **handler, bool set_value)
 {
+	if (!handler || !*handler) return IDYDB_ERROR;
 	if (!(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if ((*handler)->read_only != IDYDB_READ_AND_WRITE) { idydb_error_state(handler, 9); return IDYDB_READONLY; }
 	if ((*handler)->value_type != IDYDB_NULL && !(*handler)->value_retrieved) { idydb_error_state(handler, 10); return IDYDB_ERROR; }
@@ -1500,16 +1937,19 @@ static unsigned char idydb_insert_value_bool(idydb **handler, bool set_value)
 
 static unsigned char idydb_insert_value_vector(idydb **handler, const float* data, unsigned short dims)
 {
+	if (!handler || !*handler || !data) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if (!(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
 	if ((*handler)->read_only != IDYDB_READ_AND_WRITE) { idydb_error_state(handler, 9); return IDYDB_READONLY; }
 	if ((*handler)->value_type != IDYDB_NULL && !(*handler)->value_retrieved) { idydb_error_state(handler, 10); return IDYDB_ERROR; }
 	if (dims == 0 || dims > IDYDB_MAX_VECTOR_DIM) { idydb_error_state(handler, 11); return IDYDB_ERROR; }
+	/* Copy before clearing: data may alias a previously retrieved vector. */
+	float* copy = (float*)malloc(sizeof(float) * (size_t)dims);
+	if (!copy) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+	memcpy(copy, data, sizeof(float) * (size_t)dims);
 	idydb_clear_values(handler);
 	(*handler)->value_type  = IDYDB_VECTOR;
 	(*handler)->vector_dims = dims;
-	(*handler)->vector_value = (float*)malloc(sizeof(float) * (size_t)dims);
-	if (!(*handler)->vector_value) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
-	memcpy((*handler)->vector_value, data, sizeof(float) * (size_t)dims);
+	(*handler)->vector_value = copy;
 	return IDYDB_DONE;
 }
 
@@ -1533,7 +1973,8 @@ int idydb_insert_float(idydb **handler, idydb_column_row_sizing c, idydb_column_
 
 int idydb_insert_char(idydb **handler, idydb_column_row_sizing c, idydb_column_row_sizing r, char *value)
 {
-	unsigned int value_length = (unsigned int)strlen(value);
+	if (!handler || !*handler || !value) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
+	size_t value_length = strlen(value);
 	/* reader requires stored_len+1 <= IDYDB_MAX_CHAR_LENGTH => stored_len <= IDYDB_MAX_CHAR_LENGTH-1 */
 	if (value_length >= IDYDB_MAX_CHAR_LENGTH)
 	{
@@ -1547,7 +1988,8 @@ int idydb_insert_char(idydb **handler, idydb_column_row_sizing c, idydb_column_r
 
 int idydb_insert_const_char(idydb **handler, idydb_column_row_sizing c, idydb_column_row_sizing r, const char *value)
 {
-	unsigned int value_length = (unsigned int)strlen(value);
+	if (!handler || !*handler || !value) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
+	size_t value_length = strlen(value);
 	if (value_length >= IDYDB_MAX_CHAR_LENGTH)
 	{
 		idydb_error_state(handler, 11);
@@ -1578,19 +2020,22 @@ int idydb_insert_vector(idydb **handler, idydb_column_row_sizing c, idydb_column
 
 int idydb_delete(idydb **handler, idydb_column_row_sizing c, idydb_column_row_sizing r)
 {
+	if (!handler || !*handler) return IDYDB_ERROR;
 	idydb_insert_reset(handler);
 	return idydb_insert_at(handler, c, r);
 }
 
 /* ---------------- retrieve staged value ---------------- */
 
-static int idydb_retrieve_value_int(idydb **handler) { return ((*handler)->value_type == IDYDB_INTEGER) ? (*handler)->value.int_value : 0; }
-static float idydb_retrieve_value_float(idydb **handler) { return ((*handler)->value_type == IDYDB_FLOAT) ? (*handler)->value.float_value : 0.0f; }
-static char *idydb_retrieve_value_char(idydb **handler) { return ((*handler)->value_type == IDYDB_CHAR) ? (*handler)->value.char_value : NULL; }
-static bool idydb_retrieve_value_bool(idydb **handler) { return ((*handler)->value_type == IDYDB_BOOL) ? (*handler)->value.bool_value : false; }
+static int idydb_retrieve_value_int(idydb **handler) { return (handler && *handler && (*handler)->value_type == IDYDB_INTEGER) ? (*handler)->value.int_value : 0; }
+static float idydb_retrieve_value_float(idydb **handler) { return (handler && *handler && (*handler)->value_type == IDYDB_FLOAT) ? (*handler)->value.float_value : 0.0f; }
+static char *idydb_retrieve_value_char(idydb **handler) { return (handler && *handler && (*handler)->value_type == IDYDB_CHAR) ? (*handler)->value.char_value : NULL; }
+static bool idydb_retrieve_value_bool(idydb **handler) { return (handler && *handler && (*handler)->value_type == IDYDB_BOOL) ? (*handler)->value.bool_value : false; }
 
 static const float* idydb_retrieve_value_vector(idydb **handler, unsigned short* out_dims)
 {
+	if (out_dims) *out_dims = 0;
+	if (!handler || !*handler) return NULL;
 	if ((*handler)->value_type == IDYDB_VECTOR) {
 		if (out_dims) *out_dims = (*handler)->vector_dims;
 		return (*handler)->vector_value;
@@ -1599,7 +2044,7 @@ static const float* idydb_retrieve_value_vector(idydb **handler, unsigned short*
 	return NULL;
 }
 
-static unsigned char idydb_retrieve_value_type(idydb **handler) { return (*handler)->value_type; }
+static unsigned char idydb_retrieve_value_type(idydb **handler) { return (handler && *handler) ? (*handler)->value_type : IDYDB_NULL; }
 
 int idydb_retrieve_int(idydb **handler) { return idydb_retrieve_value_int(handler); }
 float idydb_retrieve_float(idydb **handler) { return idydb_retrieve_value_float(handler); }
@@ -1608,339 +2053,68 @@ bool idydb_retrieve_bool(idydb **handler) { return idydb_retrieve_value_bool(han
 const float* idydb_retrieve_vector(idydb **handler, unsigned short* out_dims) { return idydb_retrieve_value_vector(handler, out_dims); }
 
 /* ---------------- read value at (column,row) ---------------- */
-/* This function is your original logic (unchanged). */
+/* Decode bounded records before copying a selected payload. */
 
 static unsigned char idydb_read_at(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position)
 {
-	if (!(*handler)->configured)
-	{
+	if (!handler || !*handler || !(*handler)->configured) {
 		idydb_error_state(handler, 8);
 		return IDYDB_ERROR;
 	}
 	idydb_clear_values(handler);
+	if (column_position == 0 || row_position == 0 ||
+	    row_position - 1 > IDYDB_ROW_POSITION_MAX
 #ifdef IDYDB_ALLOW_UNSAFE
-	if (!(*handler)->unsafe)
-	{
+	    || (!(*handler)->unsafe && column_position - 1 > IDYDB_COLUMN_POSITION_MAX)
+#else
+	    || column_position - 1 > IDYDB_COLUMN_POSITION_MAX
 #endif
-		if (column_position == 0 || (column_position - 1) > IDYDB_COLUMN_POSITION_MAX || row_position == 0 || (row_position - 1) > IDYDB_ROW_POSITION_MAX)
-		{
-			idydb_error_state(handler, 12);
-			idydb_clear_values(handler);
-			return IDYDB_RANGE;
-		}
-#ifdef IDYDB_ALLOW_UNSAFE
-	}
-	else
-#endif
-		if (column_position == 0 || row_position == 0)
-	{
-		idydb_error_state(handler, 21);
-		idydb_clear_values(handler);
-		return IDYDB_RANGE;
-	}
-	else if ((row_position - 1) > IDYDB_ROW_POSITION_MAX)
-	{
+	) {
 		idydb_error_state(handler, 12);
-		idydb_clear_values(handler);
 		return IDYDB_RANGE;
 	}
-	row_position -= 1;
-	bool store_response = false;
-	idydb_sizing_max offset = 0;
-	idydb_size_selection_type skip_offset = 0;
-	unsigned char read_length = IDYDB_PARTITION_AND_SEGMENT;
-	unsigned short row_count = 0;
-	for (;;)
-	{
-		if ((offset + read_length) > (*handler)->size)
-		{
-			if ((offset + read_length) > ((*handler)->size + read_length))
-			{
-				idydb_error_state(handler, 13);
-				return IDYDB_CORRUPT;
-			}
-			break;
-		}
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-		{
-#endif
-			fseek((*handler)->file_descriptor, offset, SEEK_SET);
-			offset += read_length;
-#ifdef IDYDB_MMAP_OK
-		}
-#endif
-		if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-		{
-			unsigned short skip_amount;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				skip_amount = (unsigned short)idydb_read_mmap(offset, sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&skip_amount, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 14);
-				return IDYDB_ERROR;
-			}
-			skip_offset += skip_amount;
-			if (skip_offset > IDYDB_COLUMN_POSITION_MAX)
-			{
-#ifdef IDYDB_ALLOW_UNSAFE
-				if (!(*handler)->unsafe)
-				{
-#endif
-					idydb_error_state(handler, 22);
-					return IDYDB_RANGE;
-#ifdef IDYDB_ALLOW_UNSAFE
-				}
-#endif
-			}
-			skip_offset += 1;
-			if (skip_offset > column_position)
-				return IDYDB_NULL;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_count = (unsigned short)idydb_read_mmap((offset + sizeof(short)), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_count, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 14);
-				return IDYDB_ERROR;
-			}
-#if IDYDB_SIZING_MODE != IDYDB_SIZING_MODE_BIG
-			if (row_count > IDYDB_ROW_POSITION_MAX)
-			{
-				idydb_error_state(handler, 22);
-				return IDYDB_RANGE;
-			}
-#endif
-			row_count += 1;
-		}
-		unsigned char set_read_length = IDYDB_PARTITION_AND_SEGMENT;
-		if (skip_offset == column_position)
-		{
-			unsigned short position;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				position = (unsigned short)idydb_read_mmap((offset + ((sizeof(short) * 2) * (read_length == IDYDB_PARTITION_AND_SEGMENT))), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&position, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 14);
-				return IDYDB_ERROR;
-			}
-			if (position == row_position)
-			{
-				store_response = true;
-				row_count = 0;
-			}
-#if IDYDB_SIZING_MODE != IDYDB_SIZING_MODE_BIG
-			else if (position > IDYDB_ROW_POSITION_MAX)
-			{
-				idydb_error_state(handler, 22);
-				return IDYDB_RANGE;
-			}
-#endif
-		}
-		else
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-#endif
-			fseek((*handler)->file_descriptor, sizeof(short), SEEK_CUR);
-		if (row_count > 1)
-		{
-			row_count -= 1;
-			set_read_length = IDYDB_SEGMENT_SIZE;
-		}
-		unsigned short response_length;
-		unsigned char data_type;
-#ifdef IDYDB_MMAP_OK
-		idydb_sizing_max offset_mmap_standard_diff = offset + (sizeof(short) * 3);
-		if (read_length == IDYDB_SEGMENT_SIZE)
-			offset_mmap_standard_diff = (offset + sizeof(short));
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-		{
-			if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-				data_type = (unsigned short)idydb_read_mmap((offset + (sizeof(short) * 3)), 1, (*handler)->buffer).integer;
-			else
-				data_type = (unsigned short)idydb_read_mmap((offset + sizeof(short)), 1, (*handler)->buffer).integer;
-			offset_mmap_standard_diff += 1;
-		}
-		else
-#endif
-			if (fread(&data_type, 1, 1, (*handler)->file_descriptor) != 1)
-		{
-			idydb_error_state(handler, 14);
-			return IDYDB_ERROR;
-		}
-		(*handler)->value_retrieved = store_response;
-		switch (data_type)
-		{
-		case IDYDB_READ_INT:
-			if (store_response)
-			{
+	idydb_scan_cursor cursor = {};
+	idydb_record record = {};
+	unsigned char rc;
+	while ((rc = idydb_scan_next(handler, &cursor, &record)) == IDYDB_DONE) {
+		if (record.column > column_position) return IDYDB_NULL;
+		if (record.column != column_position || record.row != row_position) continue;
+		switch (record.type) {
+			case IDYDB_READ_INT:
+				rc = idydb_read_bytes_at(handler, record.data_offset, &(*handler)->value.int_value, sizeof(int));
 				(*handler)->value_type = IDYDB_INTEGER;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					(*handler)->value.int_value = idydb_read_mmap(offset_mmap_standard_diff, sizeof(int), (*handler)->buffer).integer;
-				else
-#endif
-					if (fread(&(*handler)->value.int_value, 1, sizeof(int), (*handler)->file_descriptor) != sizeof(int))
-				{
-					idydb_error_state(handler, 18);
-					return IDYDB_ERROR;
-				}
-				return IDYDB_DONE;
-			}
-			data_type = IDYDB_INTEGER;
-			response_length = sizeof(int);
-			break;
-		case IDYDB_READ_FLOAT:
-			if (store_response)
-			{
+				break;
+			case IDYDB_READ_FLOAT:
+				rc = idydb_read_bytes_at(handler, record.data_offset, &(*handler)->value.float_value, sizeof(float));
 				(*handler)->value_type = IDYDB_FLOAT;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					(*handler)->value.float_value = idydb_read_mmap(offset_mmap_standard_diff, sizeof(float), (*handler)->buffer).floating_point;
-				else
-#endif
-					if (fread(&(*handler)->value.float_value, 1, sizeof(float), (*handler)->file_descriptor) != sizeof(float))
-				{
-					idydb_error_state(handler, 18);
-					return IDYDB_ERROR;
-				}
-				return IDYDB_DONE;
-			}
-			data_type = IDYDB_FLOAT;
-			response_length = sizeof(float);
-			break;
-		case IDYDB_READ_CHAR:
-			data_type = IDYDB_CHAR;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				response_length = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&response_length, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 18);
-				return IDYDB_ERROR;
-			}
-			response_length += 1;
-			if (response_length > IDYDB_MAX_CHAR_LENGTH)
-			{
-				idydb_error_state(handler, 19);
-				return IDYDB_ERROR;
-			}
-			if (store_response)
-			{
-				(*handler)->value_type = data_type;
-				memset((*handler)->value.char_value, 0, sizeof((*handler)->value.char_value));
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				{
-					idydb_sizing_max offset_diff = (offset_mmap_standard_diff + sizeof(short));
-					for (idydb_sizing_max i = 0; i < response_length; i++)
-						(*handler)->value.char_value[i] = ((char *)(*handler)->buffer)[(i + offset_diff)];
-				}
-				else
-#endif
-					if (fread((*handler)->value.char_value, response_length, sizeof(char), (*handler)->file_descriptor) != sizeof(char))
-				{
-					idydb_error_state(handler, 18);
-					return IDYDB_ERROR;
-				}
-				if (strlen((*handler)->value.char_value) == 0)
-				{
-					idydb_error_state(handler, 14);
-					return IDYDB_ERROR;
-				}
-				return IDYDB_DONE;
-			}
-			response_length += sizeof(short);
-			break;
-		case IDYDB_READ_BOOL_TRUE:
-		case IDYDB_READ_BOOL_FALSE:
-			if (store_response)
-			{
+				break;
+			case IDYDB_READ_CHAR:
+				rc = idydb_read_bytes_at(handler, record.data_offset, (*handler)->value.char_value, (size_t)record.payload_size);
+				(*handler)->value_type = IDYDB_CHAR;
+				break;
+			case IDYDB_READ_BOOL_TRUE:
+			case IDYDB_READ_BOOL_FALSE:
+				(*handler)->value.bool_value = record.type == IDYDB_READ_BOOL_TRUE;
 				(*handler)->value_type = IDYDB_BOOL;
-				(*handler)->value.bool_value = (data_type == IDYDB_READ_BOOL_TRUE);
-				return IDYDB_DONE;
-			}
-			data_type = IDYDB_BOOL;
-			response_length = 0;
-			break;
-		case IDYDB_READ_VECTOR:
-		{
-			data_type = IDYDB_VECTOR;
-			unsigned short dims = 0;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				dims = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&dims, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 18);
-				return IDYDB_ERROR;
-			}
-			if (dims == 0 || dims > IDYDB_MAX_VECTOR_DIM)
-			{
-				idydb_error_state(handler, 19);
-				return IDYDB_ERROR;
-			}
-			unsigned short bytes = (unsigned short)(dims * sizeof(float));
-			if (store_response)
-			{
-				(*handler)->value_type  = data_type;
-				(*handler)->vector_dims = dims;
-				(*handler)->vector_value = (float*)malloc(sizeof(float) * (size_t)dims);
-				if (!(*handler)->vector_value)
-				{
+				rc = IDYDB_DONE;
+				break;
+			case IDYDB_READ_VECTOR:
+				(*handler)->vector_value = (float*)malloc((size_t)record.payload_size);
+				if (!(*handler)->vector_value) {
 					idydb_error_state(handler, 24);
 					return IDYDB_ERROR;
 				}
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				{
-					idydb_sizing_max base = (offset_mmap_standard_diff + sizeof(short));
-					for (unsigned short i = 0; i < dims; ++i)
-					{
-						union idydb_read_mmap_response f =
-							idydb_read_mmap((unsigned int)(base + (i * sizeof(float))), (unsigned char)sizeof(float), (*handler)->buffer);
-						(*handler)->vector_value[i] = f.floating_point;
-					}
-				}
-				else
-#endif
-				{
-					if (fread((*handler)->vector_value, sizeof(float), dims, (*handler)->file_descriptor) != dims)
-					{
-						idydb_error_state(handler, 18);
-						return IDYDB_ERROR;
-					}
-				}
-				return IDYDB_DONE;
-			}
-			response_length = bytes + sizeof(short);
-			break;
+				(*handler)->vector_dims = record.field;
+				(*handler)->value_type = IDYDB_VECTOR;
+				rc = idydb_read_bytes_at(handler, record.data_offset, (*handler)->vector_value, (size_t)record.payload_size);
+				break;
+			default: idydb_error_state(handler, 20); return IDYDB_CORRUPT;
 		}
-		default:
-			(*handler)->value_retrieved = false;
-			idydb_error_state(handler, 20);
-			return IDYDB_CORRUPT;
-		}
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-			offset += read_length;
-#endif
-		read_length = set_read_length;
-		offset += response_length;
+		if (rc != IDYDB_DONE) { idydb_clear_values(handler); return rc; }
+		(*handler)->value_retrieved = true;
+		return IDYDB_DONE;
 	}
-	return IDYDB_NULL;
+	return rc;
 }
 
 /* ---------------- insert value at (column,row) ---------------- */
@@ -1950,8 +2124,133 @@ static unsigned char idydb_read_at(idydb **handler, idydb_column_row_sizing colu
  *  - dirty flag set on success
  */
 
-static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position)
+/* Mutation clones isolate every write, including partial I/O failures. */
+static int idydb_mutation_begin(idydb** handler, idydb** staged, char** path)
 {
+    *staged = NULL;
+    *path = NULL;
+    if (!handler || !*handler || !(*handler)->configured) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
+    idydb* h = *handler;
+    if (h->read_only != IDYDB_READ_AND_WRITE) { idydb_error_state(handler, 9); return IDYDB_READONLY; }
+    if (idydb_new(staged) != IDYDB_SUCCESS) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+    idydb* copy = *staged;
+    copy->mutation_staging = true;
+    copy->encryption_enabled = h->encryption_enabled;
+#ifdef IDYDB_ALLOW_UNSAFE
+    copy->unsafe = h->unsafe;
+#endif
+    copy->size = h->size;
+    copy->read_only = IDYDB_READ_AND_WRITE;
+    copy->file_descriptor = h->encryption_enabled ? idydb_secure_plain_stream(NULL) : idydb_stage_file(h, path);
+    copy->buffer = malloc(IDYDB_MAX_BUFFER_SIZE);
+    copy->configured = copy->file_descriptor && copy->buffer;
+    if (!copy->configured) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+    memcpy(&copy->value, &h->value, sizeof(h->value));
+    copy->value_type = h->value_type;
+    copy->value_retrieved = h->value_retrieved;
+    if (h->vector_value && h->vector_dims) {
+        copy->vector_value = (float*)malloc((size_t)h->vector_dims * sizeof(float));
+        if (!copy->vector_value) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+        copy->vector_dims = h->vector_dims;
+        memcpy(copy->vector_value, h->vector_value, (size_t)h->vector_dims * sizeof(float));
+    }
+    FILE* source = h->file_descriptor;
+    if (fflush(source) != 0 || fseek(source, 0, SEEK_END) != 0) {
+        idydb_error_state(handler, 14); return IDYDB_ERROR;
+    }
+    clearerr(source);
+    long long actual_size = ftell(source);
+    if (actual_size < 0 || (uint64_t)actual_size != h->size || fseek(source, 0, SEEK_SET) != 0) {
+        idydb_error_state(handler, 14); return IDYDB_ERROR;
+    }
+    unsigned char buffer[16 * 1024];
+    idydb_sizing_max remaining = h->size;
+    while (remaining) {
+        size_t count = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+        if (IDYDB_FAULT(IDYDB_TEST_COPY_READ) || fread(buffer, 1, count, source) != count) {
+            idydb_error_state(handler, 14); return IDYDB_ERROR;
+        }
+        int failure = IDYDB_FAULT(IDYDB_TEST_COPY_WRITE);
+        if (failure) {
+            if (count / 2) (void)fwrite(buffer, 1, count / 2, copy->file_descriptor);
+            errno = failure;
+            idydb_error_state(handler, 15); return IDYDB_ERROR;
+        }
+        if (fwrite(buffer, 1, count, copy->file_descriptor) != count) {
+            idydb_error_state(handler, 15); return IDYDB_ERROR;
+        }
+        remaining -= count;
+    }
+    if (ferror(source) || fflush(copy->file_descriptor) != 0 ||
+        fseek(copy->file_descriptor, 0, SEEK_SET) != 0) {
+        idydb_error_state(handler, 15); return IDYDB_ERROR;
+    }
+    return IDYDB_DONE;
+}
+
+static void idydb_mutation_cleanup(idydb** staged, char* path, int directory_fd)
+{
+    idydb_discard(staged);
+    if (path) idydb_stage_cleanup(NULL, path, directory_fd);
+}
+
+static int idydb_mutation_finish(idydb** handler, idydb** staged, char** path, int status)
+{
+    idydb* h = *handler;
+    idydb* copy = *staged;
+    if (status != IDYDB_DONE) {
+        if (copy && copy->err_message[0]) snprintf(h->err_message, sizeof(h->err_message), "%s", copy->err_message);
+        return status;
+    }
+    status = idydb_validate_structure(staged);
+    if (status != IDYDB_DONE) {
+        snprintf(h->err_message, sizeof(h->err_message), "%s", copy->err_message);
+        return status;
+    }
+    if (fflush(copy->file_descriptor) != 0) { idydb_error_state(handler, 15); return IDYDB_ERROR; }
+    if (h->encryption_enabled) {
+        FILE* previous = h->file_descriptor;
+        h->file_descriptor = copy->file_descriptor;
+        copy->file_descriptor = NULL;
+        h->size = copy->size;
+        h->dirty = true;
+        fclose(previous);
+        return IDYDB_DONE;
+    }
+    if (fsync(fileno(copy->file_descriptor)) != 0) { idydb_error_state(handler, 15); return IDYDB_ERROR; }
+    int committed = idydb_publish(h, &copy->file_descriptor, *path, copy->size);
+    if (!copy->file_descriptor) {
+        free(*path);
+        *path = NULL; /* never unlink a file already adopted as the backing */
+        h->dirty = false;
+    }
+    if (!committed) { idydb_error_state(handler, 15); return IDYDB_ERROR; }
+    return IDYDB_DONE;
+}
+
+static unsigned char idydb_insert_at(idydb** handler, idydb_column_row_sizing column, idydb_column_row_sizing row)
+{
+    if (!handler || !*handler) return IDYDB_ERROR;
+    if ((*handler)->mutation_staging) {
+        if (IDYDB_FAULT(IDYDB_TEST_CELL_WRITE)) { idydb_error_state(handler, 15); return IDYDB_ERROR; }
+        return idydb_insert_at_inplace(handler, column, row);
+    }
+    idydb* staged = NULL;
+    char* path = NULL;
+    int status = idydb_mutation_begin(handler, &staged, &path);
+    if (status == IDYDB_DONE) {
+        if (IDYDB_FAULT(IDYDB_TEST_CELL_WRITE)) { idydb_error_state(&staged, 15); status = IDYDB_ERROR; }
+        else status = idydb_insert_at_inplace(&staged, column, row);
+        status = idydb_mutation_finish(handler, &staged, &path, status);
+    }
+    idydb_mutation_cleanup(&staged, path, (*handler)->directory_fd);
+    idydb_clear_values(handler);
+    return (unsigned char)status;
+}
+
+static unsigned char idydb_insert_at_inplace(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position)
+{
+	if (!handler || !*handler) return IDYDB_ERROR;
 	if (!(*handler)->configured)
 	{
 		idydb_error_state(handler, 8);
@@ -1963,6 +2262,8 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 		idydb_clear_values(handler);
 		return IDYDB_READONLY;
 	}
+	const unsigned char validation = idydb_validate_structure(handler);
+	if (validation != IDYDB_DONE) { idydb_clear_values(handler); return validation; }
 #ifdef IDYDB_ALLOW_UNSAFE
 	if (!(*handler)->unsafe)
 	{
@@ -1989,12 +2290,14 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 		idydb_clear_values(handler);
 		return IDYDB_RANGE;
 	}
+	const unsigned char gap_validation = idydb_validate_column_gap(handler, column_position, row_position);
+	if (gap_validation != IDYDB_DONE) { idydb_clear_values(handler); return gap_validation; }
 
+#ifdef CUWACUNU_CAMAHJUCUNU_DB_VERBOSE_DEBUG
 	/* Keep original coords for debug */
 	idydb_column_row_sizing dbg_col = column_position;
 	idydb_column_row_sizing dbg_row = row_position;
 
-#ifdef CUWACUNU_CAMAHJUCUNU_DB_VERBOSE_DEBUG
 	/* Capture before/after in a way that doesn't break the staged write. */
 	idydb_sizing_max dbg_size_before = (*handler)->size;
 
@@ -2093,11 +2396,6 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	{
 		/* FIX: payload includes '\0' */
 		unsigned short len = (unsigned short)strlen((*handler)->value.char_value);
-		if (len == 0)
-		{
-			idydb_clear_values(handler);
-			break;
-		}
 		input_size = (unsigned short)(len + 1); /* payload bytes */
 		break;
 	}
@@ -2119,7 +2417,7 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	idydb_size_selection_type skip_offset[2] = {0, 0};
 	unsigned short skip_amount[2] = {0, 0};
 	unsigned short read_length[2] = {IDYDB_PARTITION_AND_SEGMENT, IDYDB_PARTITION_AND_SEGMENT};
-	unsigned short row_count[3] = {0, 0, 0};
+	uint32_t row_count[3] = {0, 0, 0};
 	unsigned short current_length[2] = {0, 0};
 	unsigned char current_type = 0;
 
@@ -2154,7 +2452,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 				}
 				break;
 			}
-			fseek((*handler)->file_descriptor, offset[0], SEEK_SET);
+			if (fseek((*handler)->file_descriptor, offset[0], SEEK_SET) != 0)
+			{
+				idydb_clear_values(handler);
+				idydb_error_state(handler, 14);
+				return IDYDB_ERROR;
+			}
 			offset[0] += read_length[0];
 			unsigned char skip_read_offset = 1;
 			if (row_count[0] == 0)
@@ -2186,12 +2489,14 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 #endif
 				}
 				skip_offset[0] += 1;
-				if (fread(&row_count[0], 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
+				unsigned short stored_count = 0;
+				if (fread(&stored_count, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
 				{
 					idydb_clear_values(handler);
 					idydb_error_state(handler, 14);
 					return IDYDB_ERROR;
 				}
+				row_count[0] = stored_count;
 #if IDYDB_SIZING_MODE != IDYDB_SIZING_MODE_BIG
 				if (row_count[0] > IDYDB_ROW_POSITION_MAX)
 				{
@@ -2208,8 +2513,13 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 			}
 			else
 			{
-				if (skip_offset[0] != column_position)
-					fseek((*handler)->file_descriptor, skip_read_offset++, SEEK_CUR);
+				if (skip_offset[0] != column_position &&
+				    fseek((*handler)->file_descriptor, skip_read_offset++, SEEK_CUR) != 0)
+				{
+					idydb_clear_values(handler);
+					idydb_error_state(handler, 14);
+					return IDYDB_ERROR;
+				}
 				offset[1] += read_length[0];
 			}
 			current_length[0] = 0;
@@ -2314,8 +2624,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 					row_count[0] = 0;
 				break;
 			}
-			else
-				fseek((*handler)->file_descriptor, (3 - skip_read_offset), SEEK_CUR);
+			else if (fseek((*handler)->file_descriptor, (3 - skip_read_offset), SEEK_CUR) != 0)
+			{
+				idydb_clear_values(handler);
+				idydb_error_state(handler, 14);
+				return IDYDB_ERROR;
+			}
 
 			if (fread(&current_type, 1, 1, (*handler)->file_descriptor) != 1)
 			{
@@ -2413,14 +2727,24 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 			for (;;)
 			{
 				memset((*handler)->buffer, 0, (sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-				fseek((*handler)->file_descriptor, ((*handler)->size - buffer_offset), SEEK_SET);
+				if (fseek((*handler)->file_descriptor, ((*handler)->size - buffer_offset), SEEK_SET) != 0)
+				{
+					idydb_clear_values(handler);
+					idydb_error_state(handler, 14);
+					return IDYDB_ERROR;
+				}
 				if (fread((*handler)->buffer, buffer_size, 1, (*handler)->file_descriptor) != 1)
 				{
 					idydb_clear_values(handler);
 					idydb_error_state(handler, 14);
 					return IDYDB_ERROR;
 				}
-				fseek((*handler)->file_descriptor, (((*handler)->size - buffer_offset) + offset_sizing + additional_offset), SEEK_SET);
+				if (fseek((*handler)->file_descriptor, (((*handler)->size - buffer_offset) + offset_sizing + additional_offset), SEEK_SET) != 0)
+				{
+					idydb_clear_values(handler);
+					idydb_error_state(handler, 15);
+					return IDYDB_ERROR;
+				}
 				if (fwrite((*handler)->buffer, buffer_size, 1, (*handler)->file_descriptor) != 1)
 				{
 					idydb_clear_values(handler);
@@ -2431,7 +2755,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 				buffer_size = IDYDB_MAX_BUFFER_SIZE;
 				buffer_offset += buffer_size;
 			}
-			fseek((*handler)->file_descriptor, (((*handler)->size - buffer_offset) + offset_sizing + additional_offset), SEEK_SET);
+			if (fseek((*handler)->file_descriptor, (((*handler)->size - buffer_offset) + offset_sizing + additional_offset), SEEK_SET) != 0)
+			{
+				idydb_clear_values(handler);
+				idydb_error_state(handler, 14);
+				return IDYDB_ERROR;
+			}
 		}
 		(*handler)->size += offset_sizing;
 		if (current_length[1] == 0) (*handler)->size += additional_offset;
@@ -2493,14 +2822,24 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 				if (buffer_size == 0) break;
 			}
 			memset((*handler)->buffer, 0, (sizeof(char) * IDYDB_MAX_BUFFER_SIZE));
-			fseek((*handler)->file_descriptor, (deletion_point[0] + buffer_offset), SEEK_SET);
+			if (fseek((*handler)->file_descriptor, (deletion_point[0] + buffer_offset), SEEK_SET) != 0)
+			{
+				idydb_clear_values(handler);
+				idydb_error_state(handler, 14);
+				return IDYDB_ERROR;
+			}
 			if (fread((*handler)->buffer, buffer_size, 1, (*handler)->file_descriptor) != 1)
 			{
 				idydb_clear_values(handler);
 				idydb_error_state(handler, 14);
 				return IDYDB_ERROR;
 			}
-			fseek((*handler)->file_descriptor, (deletion_point[1] + buffer_offset), SEEK_SET);
+			if (fseek((*handler)->file_descriptor, (deletion_point[1] + buffer_offset), SEEK_SET) != 0)
+			{
+				idydb_clear_values(handler);
+				idydb_error_state(handler, 15);
+				return IDYDB_ERROR;
+			}
 			if (fwrite((*handler)->buffer, buffer_size, 1, (*handler)->file_descriptor) != 1)
 			{
 				idydb_clear_values(handler);
@@ -2515,7 +2854,8 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 			if (row_count[0] > 1) (*handler)->size -= IDYDB_SEGMENT_SIZE;
 			else (*handler)->size -= IDYDB_PARTITION_AND_SEGMENT;
 		}
-		if (ftruncate(fileno((*handler)->file_descriptor), (*handler)->size) != 0)
+		if (fflush((*handler)->file_descriptor) != 0 ||
+		    ftruncate(fileno((*handler)->file_descriptor), (*handler)->size) != 0)
 		{
 			idydb_clear_values(handler);
 			idydb_error_state(handler, 17);
@@ -2574,6 +2914,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 			offset[0] += (IDYDB_PARTITION_AND_SEGMENT + input_size);
 			if (offset[0] != (*handler)->size)
 			{
+				if (fseek((*handler)->file_descriptor, offset[0], SEEK_SET) != 0)
+				{
+					idydb_clear_values(handler);
+					idydb_error_state(handler, 14);
+					return IDYDB_ERROR;
+				}
 				if (fread(&skip_amount[1], sizeof(short), 1, (*handler)->file_descriptor) != 1)
 				{
 					idydb_clear_values(handler);
@@ -2582,7 +2928,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 				}
 				if (skip_amount[1] == 1) skip_amount[0] = 0;
 				else skip_amount[0] = (unsigned short)(skip_amount[1] - (skip_amount[0] + 1));
-				fseek((*handler)->file_descriptor, offset[0], SEEK_SET);
+				if (fseek((*handler)->file_descriptor, offset[0], SEEK_SET) != 0)
+				{
+					idydb_clear_values(handler);
+					idydb_error_state(handler, 15);
+					return IDYDB_ERROR;
+				}
 				if (fwrite(&skip_amount[0], sizeof(short), 1, (*handler)->file_descriptor) != 1)
 				{
 					idydb_clear_values(handler);
@@ -2597,7 +2948,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 		if (row_count[0] == 0)
 		{
 			info_skip_offset.use = true;
-			fseek((*handler)->file_descriptor, offset[0], SEEK_SET);
+			if (fseek((*handler)->file_descriptor, offset[0], SEEK_SET) != 0)
+			{
+				idydb_clear_values(handler);
+				idydb_error_state(handler, 14);
+				return IDYDB_ERROR;
+			}
 			skip_amount[1] = skip_amount[0];
 			if (fread(&skip_amount[0], 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
 			{
@@ -2614,7 +2970,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 
 	if (info_skip_offset.use)
 	{
-		fseek((*handler)->file_descriptor, info_skip_offset.position, SEEK_SET);
+		if (fseek((*handler)->file_descriptor, info_skip_offset.position, SEEK_SET) != 0)
+		{
+			idydb_clear_values(handler);
+			idydb_error_state(handler, 15);
+			return IDYDB_ERROR;
+		}
 		if (fwrite(&info_skip_offset.size, sizeof(short), 1, (*handler)->file_descriptor) != 1)
 		{
 			idydb_clear_values(handler);
@@ -2624,7 +2985,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	}
 	if (info_row_count.use)
 	{
-		fseek((*handler)->file_descriptor, info_row_count.position, SEEK_SET);
+		if (fseek((*handler)->file_descriptor, info_row_count.position, SEEK_SET) != 0)
+		{
+			idydb_clear_values(handler);
+			idydb_error_state(handler, 15);
+			return IDYDB_ERROR;
+		}
 		if (fwrite(&info_row_count.size, sizeof(short), 1, (*handler)->file_descriptor) != 1)
 		{
 			idydb_clear_values(handler);
@@ -2634,7 +3000,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	}
 	if (info_row_position.use)
 	{
-		fseek((*handler)->file_descriptor, info_row_position.position, SEEK_SET);
+		if (fseek((*handler)->file_descriptor, info_row_position.position, SEEK_SET) != 0)
+		{
+			idydb_clear_values(handler);
+			idydb_error_state(handler, 15);
+			return IDYDB_ERROR;
+		}
 		if (fwrite(&info_row_position.size, sizeof(short), 1, (*handler)->file_descriptor) != 1)
 		{
 			idydb_clear_values(handler);
@@ -2644,7 +3015,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	}
 	if (info_input_size.use)
 	{
-		fseek((*handler)->file_descriptor, info_input_size.position, SEEK_SET);
+		if (fseek((*handler)->file_descriptor, info_input_size.position, SEEK_SET) != 0)
+		{
+			idydb_clear_values(handler);
+			idydb_error_state(handler, 15);
+			return IDYDB_ERROR;
+		}
 		if (fwrite(&info_input_size.size, sizeof(short), 1, (*handler)->file_descriptor) != 1)
 		{
 			idydb_clear_values(handler);
@@ -2654,7 +3030,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	}
 	if (info_input_type.use)
 	{
-		fseek((*handler)->file_descriptor, info_input_type.position, SEEK_SET);
+		if (fseek((*handler)->file_descriptor, info_input_type.position, SEEK_SET) != 0)
+		{
+			idydb_clear_values(handler);
+			idydb_error_state(handler, 15);
+			return IDYDB_ERROR;
+		}
 		unsigned short input_type = 0;
 		switch (info_input_type.size)
 		{
@@ -2673,7 +3054,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 	}
 	if (info_input_buffer.use)
 	{
-		fseek((*handler)->file_descriptor, info_input_buffer.position, SEEK_SET);
+		if (fseek((*handler)->file_descriptor, info_input_buffer.position, SEEK_SET) != 0)
+		{
+			idydb_clear_values(handler);
+			idydb_error_state(handler, 15);
+			return IDYDB_ERROR;
+		}
 		switch (info_input_type.size)
 		{
 		case IDYDB_INTEGER:
@@ -2712,6 +3098,12 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 		}
 	}
 
+	if (fflush((*handler)->file_descriptor) != 0) {
+		idydb_clear_values(handler);
+		idydb_error_state(handler, 15);
+		return IDYDB_ERROR;
+	}
+
 	/* capture staged type before clear_values resets it */
 #ifdef CUWACUNU_CAMAHJUCUNU_DB_VERBOSE_DEBUG
 	idydb_sizing_max dbg_size_after = (*handler)->size;
@@ -2746,13 +3138,45 @@ static unsigned char idydb_insert_at(idydb **handler, idydb_column_row_sizing co
 
 /* ---------------- Vector math helpers ---------------- */
 
-static inline float idydb_dot(const float* a, const float* b, unsigned short d) {
-	float s = 0.0f;
-	for (unsigned short i = 0; i < d; ++i) s += a[i] * b[i];
-	return s;
+/* Query scans use a single bounded reader for both FILE and mmap handles. */
+static int idydb_query_column_ok(idydb **handler, idydb_column_row_sizing column)
+{
+	(void)handler; /* Only BIG mode consults the handler's unsafe flag. */
+	if (column == 0) return 0;
+#ifdef IDYDB_ALLOW_UNSAFE
+	if ((*handler)->unsafe) return 1;
+#endif
+	return (column - 1) <= IDYDB_COLUMN_POSITION_MAX;
 }
-static inline float idydb_norm(const float* a, unsigned short d) {
-	return sqrtf(idydb_dot(a, a, d));
+
+static int idydb_query_read(idydb **handler, idydb_sizing_max offset, void* out, size_t length)
+{
+	return idydb_read_bytes_at(handler, offset, out, length) == IDYDB_DONE;
+}
+
+typedef idydb_scan_cursor idydb_query_cursor;
+typedef idydb_record idydb_query_cell;
+
+/* Translate the shared scanner's status convention for count-returning queries. */
+static int idydb_query_next(idydb **handler, idydb_query_cursor* cursor, idydb_query_cell* cell)
+{
+	const unsigned char rc = idydb_scan_next(handler, cursor, cell);
+	if (rc == IDYDB_DONE) return 1;
+	if (rc == IDYDB_NULL) return 0;
+	return -1;
+}
+
+static int idydb_query_vector_ok(const float* vector, unsigned short dims)
+{
+	if (!vector || dims == 0 || dims > IDYDB_MAX_VECTOR_DIM) return 0;
+	for (unsigned short i = 0; i < dims; ++i) if (!isfinite(vector[i])) return 0;
+	return 1;
+}
+
+static void idydb_query_results_reset(idydb_knn_result* results, unsigned short k)
+{
+	if (!results) return;
+	for (unsigned short i = 0; i < k; ++i) { results[i].row = 0; results[i].score = -INFINITY; }
 }
 
 /* ---------------- Filter helpers ---------------- */
@@ -2814,263 +3238,72 @@ static inline int idydb_filter_cmp_bool(bool a, idydb_filter_op op, bool b)
 	}
 }
 
+static int idydb_filter_term_ok(idydb **handler, const idydb_filter_term* term)
+{
+	if (!term || !idydb_query_column_ok(handler, term->column)) return 0;
+	if (term->op < IDYDB_FILTER_OP_EQ || term->op > IDYDB_FILTER_OP_IS_NOT_NULL) return 0;
+	if (term->op == IDYDB_FILTER_OP_IS_NULL || term->op == IDYDB_FILTER_OP_IS_NOT_NULL) return 1;
+	if (term->type == IDYDB_NULL) return term->op == IDYDB_FILTER_OP_EQ || term->op == IDYDB_FILTER_OP_NEQ;
+	if (term->type == IDYDB_INTEGER) return 1;
+	if (term->type == IDYDB_FLOAT) return isfinite(term->value.f);
+	if (term->type == IDYDB_CHAR)
+		return term->value.s && (term->op == IDYDB_FILTER_OP_EQ || term->op == IDYDB_FILTER_OP_NEQ);
+	if (term->type == IDYDB_BOOL)
+		return term->op == IDYDB_FILTER_OP_EQ || term->op == IDYDB_FILTER_OP_NEQ;
+	return 0;
+}
+
 static int idydb_filter_build_term_mask(idydb **handler,
                                        const idydb_filter_term* term,
                                        unsigned char* term_mask,
                                        size_t mask_len)
 {
-	if (!handler || !*handler || !(*handler)->configured || !term || !term_mask || mask_len == 0) return 0;
-	if (term->column == 0) return 0;
-
-#ifdef IDYDB_ALLOW_UNSAFE
-	if (!(*handler)->unsafe)
-	{
-#endif
-		if ((term->column - 1) > IDYDB_COLUMN_POSITION_MAX) return 0;
-#ifdef IDYDB_ALLOW_UNSAFE
+	if (!idydb_filter_term_ok(handler, term)) {
+		idydb_error_statef(handler, 25, "Invalid query filter term");
+		return 0;
 	}
-#endif
-
-	/* Normalize NULL equality */
 	idydb_filter_op op = term->op;
-	unsigned char want_type = term->type;
-	if (op == IDYDB_FILTER_OP_EQ  && want_type == IDYDB_NULL) op = IDYDB_FILTER_OP_IS_NULL;
-	if (op == IDYDB_FILTER_OP_NEQ && want_type == IDYDB_NULL) op = IDYDB_FILTER_OP_IS_NOT_NULL;
+	if (term->type == IDYDB_NULL && op == IDYDB_FILTER_OP_EQ) op = IDYDB_FILTER_OP_IS_NULL;
+	if (term->type == IDYDB_NULL && op == IDYDB_FILTER_OP_NEQ) op = IDYDB_FILTER_OP_IS_NOT_NULL;
 
-	if (op == IDYDB_FILTER_OP_IS_NULL) memset(term_mask, 1, mask_len);
-	else memset(term_mask, 0, mask_len);
-	if (mask_len > 0) term_mask[0] = 0;
-
-	idydb_sizing_max offset = 0;
-	idydb_size_selection_type skip_offset = 0;
-	unsigned char read_length = IDYDB_PARTITION_AND_SEGMENT;
-	unsigned short row_count = 0;
-
-	while ((offset + read_length) <= (*handler)->size)
-	{
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-		{
-#endif
-			fseek((*handler)->file_descriptor, offset, SEEK_SET);
-			offset += read_length;
-#ifdef IDYDB_MMAP_OK
-		}
-#endif
-
-		if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-		{
-			unsigned short skip_amount = 0;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				skip_amount = (unsigned short)idydb_read_mmap(offset, sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&skip_amount, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) return 0;
-
-			skip_offset += skip_amount;
-			skip_offset += 1;
-
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_count = (unsigned short)idydb_read_mmap((offset + sizeof(short)), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_count, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) return 0;
-			row_count += 1;
-		}
-
-		unsigned char set_read_length = IDYDB_PARTITION_AND_SEGMENT;
-		const bool in_target = (skip_offset == term->column);
-		unsigned short row_pos = 0;
-
-		if (in_target)
-		{
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_pos = (unsigned short)idydb_read_mmap((offset + ((sizeof(short) * 2) * (read_length == IDYDB_PARTITION_AND_SEGMENT))), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_pos, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) return 0;
-		}
-		else
-		{
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-#endif
-				fseek((*handler)->file_descriptor, sizeof(short), SEEK_CUR);
-		}
-
-		if (row_count > 1) { row_count -= 1; set_read_length = IDYDB_SEGMENT_SIZE; }
-
-		unsigned char data_type;
-#ifdef IDYDB_MMAP_OK
-		idydb_sizing_max offset_mmap_standard_diff = offset + (sizeof(short) * 3);
-		if (read_length == IDYDB_SEGMENT_SIZE) offset_mmap_standard_diff = (offset + sizeof(short));
-
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-		{
-			if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-				data_type = (unsigned short)idydb_read_mmap((offset + (sizeof(short) * 3)), 1, (*handler)->buffer).integer;
-			else
-				data_type = (unsigned short)idydb_read_mmap((offset + sizeof(short)), 1, (*handler)->buffer).integer;
-			offset_mmap_standard_diff += 1; /* now points to payload start */
-		}
-		else
-#endif
-			if (fread(&data_type, 1, 1, (*handler)->file_descriptor) != 1) return 0;
-
-		unsigned short adv = 0;
-
-		/* Helper: set mask for this row if in range */
-		const idydb_column_row_sizing row_api = (idydb_column_row_sizing)(row_pos + 1);
-		const int row_in_range = ((size_t)row_api < mask_len);
-
-		switch (data_type)
-		{
-			case IDYDB_READ_BOOL_TRUE:
-			case IDYDB_READ_BOOL_FALSE:
-			{
-				adv = 0;
-				if (in_target && row_in_range)
-				{
-					if (op == IDYDB_FILTER_OP_IS_NULL) term_mask[row_api] = 0;
-					else if (op == IDYDB_FILTER_OP_IS_NOT_NULL) term_mask[row_api] = 1;
-					else if (want_type == IDYDB_BOOL) {
-						bool v = (data_type == IDYDB_READ_BOOL_TRUE);
-						term_mask[row_api] = (unsigned char)(idydb_filter_cmp_bool(v, op, term->value.b) ? 1 : 0);
-					}
-				}
-				break;
+	/* Missing cells are the database's NULL representation. */
+	memset(term_mask, op == IDYDB_FILTER_OP_IS_NULL ? 1 : 0, mask_len);
+	term_mask[0] = 0;
+	idydb_query_cursor cursor = {};
+	idydb_query_cell cell;
+	int rc;
+	while ((rc = idydb_query_next(handler, &cursor, &cell)) > 0) {
+		if (cell.column != term->column || (size_t)cell.row >= mask_len) continue;
+		unsigned char* match = &term_mask[(size_t)cell.row];
+		if (op == IDYDB_FILTER_OP_IS_NULL) { *match = 0; continue; }
+		if (op == IDYDB_FILTER_OP_IS_NOT_NULL) { *match = 1; continue; }
+		if (cell.type == IDYDB_READ_BOOL_TRUE || cell.type == IDYDB_READ_BOOL_FALSE) {
+			if (term->type == IDYDB_BOOL)
+				*match = (unsigned char)idydb_filter_cmp_bool(cell.type == IDYDB_READ_BOOL_TRUE, op, term->value.b);
+		} else if (cell.type == IDYDB_READ_INT && term->type == IDYDB_INTEGER) {
+			int value;
+			if (!idydb_query_read(handler, cell.data_offset, &value, sizeof(value))) return 0;
+			*match = (unsigned char)idydb_filter_cmp_int(value, op, term->value.i);
+		} else if (cell.type == IDYDB_READ_FLOAT && term->type == IDYDB_FLOAT) {
+			float value;
+			if (!idydb_query_read(handler, cell.data_offset, &value, sizeof(value))) return 0;
+			*match = (unsigned char)idydb_filter_cmp_float(value, op, term->value.f);
+		} else if (cell.type == IDYDB_READ_CHAR && term->type == IDYDB_CHAR) {
+			const size_t wanted_length = strlen(term->value.s);
+			int equal = wanted_length == (size_t)cell.field;
+			size_t position = 0;
+			while (equal && position < wanted_length) {
+				char buffer[1024];
+				size_t length = wanted_length - position;
+				if (length > sizeof(buffer)) length = sizeof(buffer);
+				if (!idydb_query_read(handler, cell.data_offset + position, buffer, length)) return 0;
+				equal = memcmp(buffer, term->value.s + position, length) == 0;
+				position += length;
 			}
-
-			case IDYDB_READ_INT:
-			{
-				adv = sizeof(int);
-				if (in_target && row_in_range)
-				{
-					if (op == IDYDB_FILTER_OP_IS_NULL) term_mask[row_api] = 0;
-					else if (op == IDYDB_FILTER_OP_IS_NOT_NULL) term_mask[row_api] = 1;
-					else if (want_type == IDYDB_INTEGER) {
-						int v = 0;
-#ifdef IDYDB_MMAP_OK
-						if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-							v = idydb_read_mmap(offset_mmap_standard_diff, sizeof(int), (*handler)->buffer).integer;
-						else
-#endif
-							(void)fread(&v, 1, sizeof(int), (*handler)->file_descriptor);
-						term_mask[row_api] = (unsigned char)(idydb_filter_cmp_int(v, op, term->value.i) ? 1 : 0);
-					}
-				}
-				break;
-			}
-
-			case IDYDB_READ_FLOAT:
-			{
-				adv = sizeof(float);
-				if (in_target && row_in_range)
-				{
-					if (op == IDYDB_FILTER_OP_IS_NULL) term_mask[row_api] = 0;
-					else if (op == IDYDB_FILTER_OP_IS_NOT_NULL) term_mask[row_api] = 1;
-					else if (want_type == IDYDB_FLOAT) {
-						float v = 0.0f;
-#ifdef IDYDB_MMAP_OK
-						if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-							v = idydb_read_mmap(offset_mmap_standard_diff, sizeof(float), (*handler)->buffer).floating_point;
-						else
-#endif
-							(void)fread(&v, 1, sizeof(float), (*handler)->file_descriptor);
-						term_mask[row_api] = (unsigned char)(idydb_filter_cmp_float(v, op, term->value.f) ? 1 : 0);
-					}
-				}
-				break;
-			}
-
-			case IDYDB_READ_CHAR:
-			{
-				unsigned short n = 0; /* stored length (no '\0') */
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					n = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-				else
-#endif
-					(void)fread(&n, 1, sizeof(short), (*handler)->file_descriptor);
-				adv = (unsigned short)(sizeof(short) + n + 1);
-
-				if (in_target && row_in_range)
-				{
-					if (op == IDYDB_FILTER_OP_IS_NULL) term_mask[row_api] = 0;
-					else if (op == IDYDB_FILTER_OP_IS_NOT_NULL) term_mask[row_api] = 1;
-					else if (want_type == IDYDB_CHAR)
-					{
-						const char* want = (term->value.s ? term->value.s : "");
-						const size_t want_len = strlen(want);
-						int eq = 0;
-						if (want_len == (size_t)n)
-						{
-#ifdef IDYDB_MMAP_OK
-							if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-							{
-								const char* p = (const char*)((char*)(*handler)->buffer + (offset_mmap_standard_diff + sizeof(short)));
-								eq = (memcmp(p, want, want_len) == 0);
-							}
-							else
-#endif
-							{
-								/* Stream compare; ok to stop early (next loop fseek()s anyway) */
-								size_t pos = 0;
-								eq = 1;
-								char buf[1024];
-								while (pos < want_len)
-								{
-									size_t chunk = want_len - pos;
-									if (chunk > sizeof(buf)) chunk = sizeof(buf);
-									if (fread(buf, 1, chunk, (*handler)->file_descriptor) != chunk) { eq = 0; break; }
-									if (memcmp(buf, want + pos, chunk) != 0) { eq = 0; break; }
-									pos += chunk;
-								}
-							}
-						}
-						if (op == IDYDB_FILTER_OP_EQ) term_mask[row_api] = (unsigned char)(eq ? 1 : 0);
-						else if (op == IDYDB_FILTER_OP_NEQ) term_mask[row_api] = (unsigned char)(eq ? 0 : 1);
-					}
-				}
-				break;
-			}
-
-			case IDYDB_READ_VECTOR:
-			{
-				unsigned short d = 0;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					d = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-				else
-#endif
-					(void)fread(&d, 1, sizeof(short), (*handler)->file_descriptor);
-				adv = (unsigned short)(sizeof(short) + d * sizeof(float));
-
-				if (in_target && row_in_range)
-				{
-					/* Only NULL-ness is supported for VECTOR in filters (keeps it sane). */
-					if (op == IDYDB_FILTER_OP_IS_NULL) term_mask[row_api] = 0;
-					else if (op == IDYDB_FILTER_OP_IS_NOT_NULL) term_mask[row_api] = 1;
-				}
-				break;
-			}
-
-			default:
-				return 0;
+			*match = (unsigned char)(op == IDYDB_FILTER_OP_EQ ? equal : !equal);
 		}
-
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-			offset += read_length;
-#endif
-		read_length = set_read_length;
-		offset += adv;
 	}
-
-	return 1;
+	return rc == 0;
 }
 
 static int idydb_filter_build_allowed_mask(idydb **handler,
@@ -3078,31 +3311,43 @@ static int idydb_filter_build_allowed_mask(idydb **handler,
                                           unsigned char* allowed,
                                           size_t allowed_len)
 {
-	if (!allowed || allowed_len == 0) return 0;
 	memset(allowed, 1, allowed_len);
-	if (allowed_len > 0) allowed[0] = 0;
-
-	if (!filter || filter->nterms == 0 || !filter->terms) return 1;
-
-	unsigned char* tmp = (unsigned char*)malloc(allowed_len);
-	if (!tmp) return 0;
-
-	for (size_t t = 0; t < filter->nterms; ++t)
-	{
-		if (!idydb_filter_build_term_mask(handler, &filter->terms[t], tmp, allowed_len))
-		{
-			free(tmp);
+	allowed[0] = 0;
+	if (!filter || filter->nterms == 0) return 1;
+	if (!filter->terms) {
+		idydb_error_statef(handler, 25, "Filter has terms count but no terms");
+		return 0;
+	}
+	unsigned char* temporary = (unsigned char*)malloc(allowed_len);
+	if (!temporary) { idydb_error_state(handler, 24); return 0; }
+	for (size_t term = 0; term < filter->nterms; ++term) {
+		if (!idydb_filter_build_term_mask(handler, &filter->terms[term], temporary, allowed_len)) {
+			free(temporary);
 			return 0;
 		}
-		for (size_t i = 0; i < allowed_len; ++i)
-			allowed[i] = (unsigned char)((allowed[i] && tmp[i]) ? 1 : 0);
+		for (size_t row = 0; row < allowed_len; ++row)
+			allowed[row] = (unsigned char)(allowed[row] && temporary[row]);
 	}
-
-	free(tmp);
+	free(temporary);
 	return 1;
 }
 
 /* ---------------- Column scanning for kNN ---------------- */
+
+typedef struct {
+	idydb_column_row_sizing row;
+	double score;
+} idydb_query_candidate;
+
+static int idydb_query_candidate_compare(const void* left, const void* right)
+{
+	const idydb_query_candidate* a = (const idydb_query_candidate*)left;
+	const idydb_query_candidate* b = (const idydb_query_candidate*)right;
+	if (!a->row) return b->row ? 1 : 0;
+	if (!b->row) return -1;
+	if (a->score != b->score) return a->score > b->score ? -1 : 1;
+	return a->row < b->row ? -1 : a->row > b->row;
+}
 
 static int idydb_knn_search_vector_column_internal(idydb **handler,
                                    idydb_column_row_sizing vector_column,
@@ -3114,236 +3359,91 @@ static int idydb_knn_search_vector_column_internal(idydb **handler,
                                    size_t allowed_len,
                                    idydb_knn_result* out_results)
 {
-	if (!(*handler) || !(*handler)->configured || !query || dims == 0 || dims > IDYDB_MAX_VECTOR_DIM || k == 0 || !out_results)
-	{
-		idydb_error_state(handler, 8);
+	idydb_query_results_reset(out_results, k);
+	if (!handler || !*handler || !(*handler)->configured || !out_results || k == 0 ||
+		!idydb_query_vector_ok(query, dims) || (metric != IDYDB_SIM_COSINE && metric != IDYDB_SIM_L2)) {
+		idydb_error_statef(handler, 8, "Invalid vector query arguments");
 		return -1;
 	}
-#ifdef IDYDB_ALLOW_UNSAFE
-	if (!(*handler)->unsafe)
-	{
-#endif
-		if (vector_column == 0 || (vector_column - 1) > IDYDB_COLUMN_POSITION_MAX)
-		{
-			idydb_error_state(handler, 12);
-			return -1;
-		}
-#ifdef IDYDB_ALLOW_UNSAFE
-	}
-#endif
-	for (unsigned short i = 0; i < k; ++i) { out_results[i].row = 0; out_results[i].score = -INFINITY; }
+	if (!idydb_query_column_ok(handler, vector_column)) { idydb_error_state(handler, 12); return -1; }
+	idydb_query_candidate* candidates = (idydb_query_candidate*)calloc(k, sizeof(idydb_query_candidate));
+	if (!candidates) { idydb_error_state(handler, 24); return -1; }
+	for (unsigned short i = 0; i < k; ++i) candidates[i].score = -INFINITY;
 
-	float query_norm = 1.0f;
+	/* Double accumulators keep valid, finite float inputs from overflowing during scoring. */
+	double query_norm_squared = 0.0;
 	if (metric == IDYDB_SIM_COSINE)
-	{
-		query_norm = idydb_norm(query, dims);
-		if (query_norm == 0.0f) query_norm = 1.0f;
-	}
+		for (unsigned short i = 0; i < dims; ++i) query_norm_squared += (double)query[i] * query[i];
+	double query_norm = sqrt(query_norm_squared);
+	if (query_norm == 0.0) query_norm = 1.0;
 
-	idydb_sizing_max offset = 0;
-	idydb_size_selection_type skip_offset = 0;
-	unsigned char read_length = IDYDB_PARTITION_AND_SEGMENT;
-	unsigned short row_count = 0;
+	idydb_query_cursor cursor = {};
+	idydb_query_cell cell;
+	int rc;
+	while ((rc = idydb_query_next(handler, &cursor, &cell)) > 0) {
+		if (cell.column != vector_column || cell.type != IDYDB_READ_VECTOR || cell.field != dims) continue;
+		if (allowed && ((size_t)cell.row >= allowed_len || !allowed[(size_t)cell.row])) continue;
 
-	while ((offset + read_length) <= (*handler)->size)
-	{
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-		{
-#endif
-			fseek((*handler)->file_descriptor, offset, SEEK_SET);
-			offset += read_length;
-#ifdef IDYDB_MMAP_OK
-		}
-#endif
-		if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-		{
-			unsigned short skip_amount = 0;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				skip_amount = (unsigned short)idydb_read_mmap(offset, sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&skip_amount, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 14);
+		double dot = 0.0, squared_distance = 0.0, norm_squared = 0.0;
+		for (size_t start = 0; start < dims; start += 256) {
+			float values[256];
+			size_t length = dims - start;
+			if (length > 256) length = 256;
+			if (!idydb_query_read(handler, cell.data_offset + start * sizeof(float), values, length * sizeof(float))) {
+				free(candidates);
 				return -1;
 			}
-			skip_offset += skip_amount;
-			skip_offset += 1;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_count = (unsigned short)idydb_read_mmap((offset + sizeof(short)), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_count, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 14);
-				return -1;
-			}
-			row_count += 1;
-		}
-
-		unsigned char set_read_length = IDYDB_PARTITION_AND_SEGMENT;
-
-		unsigned short row_pos = 0;
-		if (skip_offset == vector_column) {
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_pos = (unsigned short)idydb_read_mmap((offset + ((sizeof(short) * 2) * (read_length == IDYDB_PARTITION_AND_SEGMENT))), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_pos, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short))
-			{
-				idydb_error_state(handler, 14);
-				return -1;
-			}
-		} else {
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-#endif
-				fseek((*handler)->file_descriptor, sizeof(short), SEEK_CUR);
-		}
-
-		if (row_count > 1) { row_count -= 1; set_read_length = IDYDB_SEGMENT_SIZE; }
-
-		unsigned char data_type;
-#ifdef IDYDB_MMAP_OK
-		idydb_sizing_max offset_mmap_standard_diff = offset + (sizeof(short) * 3);
-		if (read_length == IDYDB_SEGMENT_SIZE)
-			offset_mmap_standard_diff = (offset + sizeof(short));
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-		{
-			if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-				data_type = (unsigned short)idydb_read_mmap((offset + (sizeof(short) * 3)), 1, (*handler)->buffer).integer;
-			else
-				data_type = (unsigned short)idydb_read_mmap((offset + sizeof(short)), 1, (*handler)->buffer).integer;
-			offset_mmap_standard_diff += 1;
-		}
-		else
-#endif
-			if (fread(&data_type, 1, 1, (*handler)->file_descriptor) != 1)
-		{
-			idydb_error_state(handler, 14);
-			return -1;
-		}
-
-		unsigned short adv = 0;
-		switch (data_type)
-		{
-			case IDYDB_READ_CHAR: {
-				unsigned short n = 0;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					n = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-				else
-#endif
-					if (fread(&n, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) { idydb_error_state(handler, 14); return -1; }
-				adv = (unsigned short)(sizeof(short) + n + 1);
-				break;
-			}
-			case IDYDB_READ_INT:   adv = sizeof(int);   break;
-			case IDYDB_READ_FLOAT: adv = sizeof(float); break;
-			case IDYDB_READ_BOOL_TRUE:
-			case IDYDB_READ_BOOL_FALSE:
-				adv = 0; break;
-			case IDYDB_READ_VECTOR: {
-				unsigned short vdims = 0;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					vdims = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-				else
-#endif
-					if (fread(&vdims, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) { idydb_error_state(handler, 14); return -1; }
-				adv = (unsigned short)(sizeof(short) + vdims * sizeof(float));
-
-				if (skip_offset == vector_column && vdims == dims) {
-					const idydb_column_row_sizing row_api = (idydb_column_row_sizing)(row_pos + 1);
-					if (allowed && ((size_t)row_api >= allowed_len || allowed[row_api] == 0))
-					{
-						/* Row filtered out: do not score it. In non-mmap, we also avoid reading floats. */
-#ifdef IDYDB_MMAP_OK
-						if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-#endif
-						{
-							/* No-op: next loop fseek()s to offset anyway. */
-						}
-						break;
-					}
-					float score = -INFINITY;
-#ifdef IDYDB_MMAP_OK
-					if ((*handler)->read_only == IDYDB_READONLY_MMAPPED) {
-						idydb_sizing_max base = offset_mmap_standard_diff + sizeof(short);
-						float dot = 0.0f, l2acc = 0.0f, normB = 0.0f;
-						for (unsigned short i = 0; i < dims; ++i) {
-							union idydb_read_mmap_response f =
-								idydb_read_mmap((unsigned int)(base + (i * sizeof(float))), (unsigned char)sizeof(float), (*handler)->buffer);
-							float b = f.floating_point;
-							if (metric == IDYDB_SIM_COSINE) { dot += query[i] * b; normB += b*b; }
-							else { float d = query[i]-b; l2acc += d*d; }
-						}
-						if (metric == IDYDB_SIM_COSINE) {
-							normB = sqrtf(normB); if (normB == 0.0f) normB = 1.0f;
-							score = dot / (query_norm * normB);
-						} else {
-							score = -sqrtf(l2acc);
-						}
-					} else
-#endif
-					{
-						float dot = 0.0f, l2acc = 0.0f, normB = 0.0f;
-						for (unsigned short i = 0; i < dims; ++i) {
-							float b;
-							if (fread(&b, sizeof(float), 1, (*handler)->file_descriptor) != 1) { idydb_error_state(handler, 18); return -1; }
-							if (metric == IDYDB_SIM_COSINE) { dot += query[i]*b; normB += b*b; }
-							else { float d = query[i]-b; l2acc += d*d; }
-						}
-						if (metric == IDYDB_SIM_COSINE) {
-							float normBv = sqrtf(normB); if (normBv == 0.0f) normBv = 1.0f;
-							score = dot / (query_norm * normBv);
-						} else {
-							score = -sqrtf(l2acc);
-						}
-					}
-
-					unsigned short worst = 0;
-					float worstScore = out_results[0].score;
-					for (unsigned short i = 1; i < k; ++i) {
-						if (out_results[i].score < worstScore) { worstScore = out_results[i].score; worst = i; }
-					}
-					if (score > worstScore) {
-						out_results[worst].row = (idydb_column_row_sizing)(row_pos + 1);
-						out_results[worst].score = score;
-					}
+			for (size_t component = 0; component < length; ++component) {
+				const float value = values[component];
+				if (!isfinite(value)) {
+					idydb_error_statef(handler, 13, "Stored vector has a nonfinite component");
+					free(candidates);
+					return -1;
 				}
-				break;
+				if (metric == IDYDB_SIM_COSINE) {
+					dot += (double)query[start + component] * value;
+					norm_squared += (double)value * value;
+				} else {
+					const double difference = (double)query[start + component] - value;
+					squared_distance += difference * difference;
+				}
 			}
-			default:
-				idydb_error_state(handler, 20);
-				return -1;
 		}
-
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-			offset += read_length;
-#endif
-		read_length = set_read_length;
-		offset += adv;
+		double score;
+		if (metric == IDYDB_SIM_COSINE) {
+			double norm = sqrt(norm_squared);
+			if (norm == 0.0) norm = 1.0;
+			double similarity = dot / (query_norm * norm);
+			if (similarity > 1.0) similarity = 1.0;
+			if (similarity < -1.0) similarity = -1.0;
+			score = similarity;
+		} else {
+			score = -sqrt(squared_distance);
+		}
+		unsigned short worst = 0;
+		for (unsigned short i = 1; i < k; ++i) {
+			if (!candidates[worst].row) break;
+			if (!candidates[i].row || candidates[i].score < candidates[worst].score ||
+				(candidates[i].score == candidates[worst].score && candidates[i].row > candidates[worst].row)) worst = i;
+		}
+		if (!candidates[worst].row || score > candidates[worst].score ||
+			(score == candidates[worst].score && cell.row < candidates[worst].row)) {
+			candidates[worst].row = cell.row;
+			candidates[worst].score = score;
+		}
 	}
-
+	if (rc < 0) { free(candidates); return -1; }
+	qsort(candidates, k, sizeof(idydb_query_candidate), idydb_query_candidate_compare);
+	int count = 0;
 	for (unsigned short i = 0; i < k; ++i) {
-		for (unsigned short j = i+1; j < k; ++j) {
-			if (out_results[j].row != 0 && (out_results[i].row == 0 || out_results[j].score > out_results[i].score)) {
-				idydb_knn_result tmp = out_results[i];
-				out_results[i] = out_results[j];
-				out_results[j] = tmp;
-			}
-		}
+		if (!candidates[i].row) break;
+		out_results[i].row = candidates[i].row;
+		/* Rank with double precision; clamp scores beyond the public float range. */
+		out_results[i].score = candidates[i].score < -(double)3.402823466e38F ? -3.402823466e38F : (float)candidates[i].score;
+		++count;
 	}
-
-	unsigned short count = 0;
-	for (unsigned short i = 0; i < k; ++i) if (out_results[i].row != 0) ++count;
-	return (int)count;
+	free(candidates);
+	return count;
 }
 
 int idydb_knn_search_vector_column(idydb **handler,
@@ -3366,145 +3466,52 @@ int idydb_knn_search_vector_column_filtered(idydb **handler,
                                             const idydb_filter* filter,
                                             idydb_knn_result* out_results)
 {
-	if (!out_results) { idydb_error_state(handler, 8); return -1; }
-
-	const size_t allowed_len = (size_t)IDYDB_ROW_POSITION_MAX + 2;
+	idydb_query_results_reset(out_results, k);
+	if (!handler || !*handler || !(*handler)->configured || !out_results || k == 0 ||
+		!idydb_query_vector_ok(query, dims) || (metric != IDYDB_SIM_COSINE && metric != IDYDB_SIM_L2)) {
+		idydb_error_statef(handler, 8, "Invalid vector query arguments");
+		return -1;
+	}
+	const size_t allowed_len = 65538; /* disk rows are uint16, exposed as 1-based indices */
 	unsigned char* allowed = NULL;
-
-	if (filter && filter->terms && filter->nterms > 0)
-	{
+	if (filter && filter->nterms > 0) {
 		allowed = (unsigned char*)malloc(allowed_len);
 		if (!allowed) { idydb_error_state(handler, 24); return -1; }
-		if (!idydb_filter_build_allowed_mask(handler, filter, allowed, allowed_len))
-		{
+		if (!idydb_filter_build_allowed_mask(handler, filter, allowed, allowed_len)) {
 			free(allowed);
-			idydb_error_state(handler, 26);
 			return -1;
 		}
 	}
-
-	int n = idydb_knn_search_vector_column_internal(handler, vector_column, query, dims, k, metric, allowed, allowed_len, out_results);
-	if (allowed) free(allowed);
-	return n;
+	const int count = idydb_knn_search_vector_column_internal(handler, vector_column, query, dims, k, metric, allowed, allowed_len, out_results);
+	free(allowed);
+	return count;
 }
 
 /* ---------------- Utility: next row index ---------------- */
-/* Your original function (unchanged) */
 
 idydb_column_row_sizing idydb_column_next_row(idydb **handler, idydb_column_row_sizing column)
 {
-	if (!(*handler) || !(*handler)->configured) return 1;
-	idydb_sizing_max offset = 0;
-	idydb_size_selection_type skip_offset = 0;
-	unsigned char read_length = IDYDB_PARTITION_AND_SEGMENT;
-	unsigned short row_count = 0;
-	unsigned short max_row = 0;
-	while ((offset + read_length) <= (*handler)->size)
-	{
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-		{
-#endif
-			fseek((*handler)->file_descriptor, offset, SEEK_SET);
-			offset += read_length;
-#ifdef IDYDB_MMAP_OK
-		}
-#endif
-		if (read_length == IDYDB_PARTITION_AND_SEGMENT)
-		{
-			unsigned short skip_amount = 0;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				skip_amount = (unsigned short)idydb_read_mmap(offset, sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&skip_amount, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) break;
-			skip_offset += skip_amount;
-			skip_offset += 1;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_count = (unsigned short)idydb_read_mmap((offset + sizeof(short)), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_count, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) break;
-			row_count += 1;
-		}
-		unsigned char set_read_length = IDYDB_PARTITION_AND_SEGMENT;
-		if (skip_offset == column)
-		{
-			unsigned short row_pos = 0;
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-				row_pos = (unsigned short)idydb_read_mmap((offset + ((sizeof(short) * 2) * (read_length == IDYDB_PARTITION_AND_SEGMENT))), sizeof(short), (*handler)->buffer).integer;
-			else
-#endif
-				if (fread(&row_pos, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) break;
-			if ((row_pos + 1) > max_row) max_row = (unsigned short)(row_pos + 1);
-		}
-		else
-#ifdef IDYDB_MMAP_OK
-			if ((*handler)->read_only != IDYDB_READONLY_MMAPPED)
-#endif
-			fseek((*handler)->file_descriptor, sizeof(short), SEEK_CUR);
-
-		if (row_count > 1) { row_count -= 1; set_read_length = IDYDB_SEGMENT_SIZE; }
-
-		unsigned char t;
-#ifdef IDYDB_MMAP_OK
-		idydb_sizing_max offset_mmap_standard_diff = offset + (sizeof(short) * 3);
-		if (read_length == IDYDB_SEGMENT_SIZE)
-			offset_mmap_standard_diff = (offset + sizeof(short));
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-			t = (unsigned short)idydb_read_mmap((read_length == IDYDB_PARTITION_AND_SEGMENT ? (offset + (sizeof(short) * 3)) : (offset + sizeof(short))), 1, (*handler)->buffer).integer;
-		else
-#endif
-			if (fread(&t, 1, 1, (*handler)->file_descriptor) != 1) break;
-
-		unsigned short adv = 0;
-		switch (t) {
-			case IDYDB_READ_CHAR: {
-				unsigned short n = 0;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					n = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-				else
-#endif
-					if (fread(&n, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) n = 0;
-				adv = (unsigned short)(sizeof(short) + n + 1);
-				break;
-			}
-			case IDYDB_READ_INT:   adv = sizeof(int); break;
-			case IDYDB_READ_FLOAT: adv = sizeof(float); break;
-			case IDYDB_READ_BOOL_TRUE:
-			case IDYDB_READ_BOOL_FALSE:
-				adv = 0; break;
-			case IDYDB_READ_VECTOR: {
-				unsigned short d = 0;
-#ifdef IDYDB_MMAP_OK
-				if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-					d = (unsigned short)idydb_read_mmap(offset_mmap_standard_diff, sizeof(short), (*handler)->buffer).integer;
-				else
-#endif
-					if (fread(&d, 1, sizeof(short), (*handler)->file_descriptor) != sizeof(short)) d = 0;
-				adv = (unsigned short)(sizeof(short) + d * sizeof(float));
-				break;
-			}
-			default: break;
-		}
-#ifdef IDYDB_MMAP_OK
-		if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
-			offset += read_length;
-#endif
-		read_length = set_read_length;
-		offset += adv;
+	if (!handler || !*handler || !(*handler)->configured) { idydb_error_state(handler, 8); return 0; }
+	if (!idydb_query_column_ok(handler, column)) { idydb_error_state(handler, 12); return 0; }
+	idydb_query_cursor cursor = {};
+	idydb_query_cell cell;
+	idydb_column_row_sizing maximum = 0;
+	int rc;
+	while ((rc = idydb_query_next(handler, &cursor, &cell)) > 0)
+		if (cell.column == column && cell.row > maximum) maximum = cell.row;
+	if (rc < 0) return 0;
+	if (maximum >= (idydb_column_row_sizing)IDYDB_ROW_POSITION_MAX + 1) {
+		idydb_error_state(handler, 12);
+		return 0;
 	}
-	return (idydb_column_row_sizing)(max_row + 1);
+	return maximum + 1;
 }
 
-/* ---------------- RAG helpers (unchanged from your version) ---------------- */
+/* ---------------- RAG helpers ---------------- */
 
-void idydb_set_embedder(idydb **handler, idydb_embed_fn fn, void* user) {
-	if (!(*handler)) return;
+void idydb_set_embedder(idydb **handler, idydb_embed_fn fn, void* user)
+{
+	if (!handler || !*handler) return;
 	(*handler)->embedder = fn;
 	(*handler)->embedder_user = user;
 }
@@ -3517,10 +3524,28 @@ int idydb_rag_upsert_text(idydb **handler,
                           const float* embedding,
                           unsigned short dims)
 {
-	if (!text || !embedding || dims == 0) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
-	int rc = idydb_insert_const_char(handler, text_column, row, text);
-	if (rc != IDYDB_DONE) return rc;
-	rc = idydb_insert_vector(handler, vector_column, row, embedding, dims);
+	/* Both cells are built in one private snapshot, then committed together. */
+	if (!handler || !*handler || !(*handler)->configured || !text || !idydb_query_vector_ok(embedding, dims)) {
+		idydb_error_statef(handler, 8, "Invalid RAG upsert arguments");
+		return IDYDB_ERROR;
+	}
+	if (!idydb_query_column_ok(handler, text_column) || !idydb_query_column_ok(handler, vector_column) ||
+		text_column == vector_column || row == 0 || row > IDYDB_MAX_POSITION) {
+		idydb_error_state(handler, 12);
+		return IDYDB_RANGE;
+	}
+	if (strlen(text) >= IDYDB_MAX_CHAR_LENGTH) { idydb_error_state(handler, 11); return IDYDB_ERROR; }
+	idydb* staged = NULL;
+	char* path = NULL;
+	int rc = idydb_mutation_begin(handler, &staged, &path);
+	if (rc == IDYDB_DONE) {
+		idydb_clear_values(&staged);
+		rc = idydb_insert_const_char(&staged, text_column, row, text);
+		if (rc == IDYDB_DONE) rc = idydb_insert_vector(&staged, vector_column, row, embedding, dims);
+		rc = idydb_mutation_finish(handler, &staged, &path, rc);
+	}
+	idydb_mutation_cleanup(&staged, path, (*handler)->directory_fd);
+	idydb_clear_values(handler);
 	return rc;
 }
 
@@ -3530,28 +3555,31 @@ int idydb_rag_upsert_text_auto_embed(idydb **handler,
                                      idydb_column_row_sizing row,
                                      const char* text)
 {
-	if (!(*handler) || !(*handler)->embedder || !text) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
-	float* vec = NULL; unsigned short dims = 0;
-	int erc = (*handler)->embedder(text, &vec, &dims, (*handler)->embedder_user);
-	if (erc != 0 || !vec || dims == 0) { if (vec) free(vec); idydb_error_state(handler, 24); return IDYDB_ERROR; }
-	int rc = idydb_rag_upsert_text(handler, text_column, vector_column, row, text, vec, dims);
-	free(vec);
-	return rc;
+	if (!handler || !*handler || !(*handler)->configured || !(*handler)->embedder || !text) {
+		idydb_error_state(handler, 8);
+		return IDYDB_ERROR;
+	}
+	float* vector = NULL;
+	unsigned short dims = 0;
+	const int rc = (*handler)->embedder(text, &vector, &dims, (*handler)->embedder_user);
+	if (rc != 0 || !idydb_query_vector_ok(vector, dims)) {
+		free(vector);
+		idydb_error_statef(handler, 25, "Embedder failed or returned an invalid vector");
+		return IDYDB_ERROR;
+	}
+	const int status = idydb_rag_upsert_text(handler, text_column, vector_column, row, text, vector, dims);
+	free(vector);
+	return status;
 }
 
-/* ---------------- Return conventions ----------------
- *
- * Most APIs return an IDYDB_* status code:
- *   - IDYDB_DONE / IDYDB_SUCCESS on success
- *   - other IDYDB_* codes on failure (see idydb_errmsg)
- *
- * Some query-style APIs return a COUNT:
- *   - returns n in [0..k] on success (0 means “no hits”, not an error)
- *   - returns -1 on error (details in idydb_errmsg)
- *
- * IMPORTANT: wrappers must treat these as “count-returning” and check (rc < 0),
- * not (rc != IDYDB_DONE).
- */
+/* Query APIs return a count in [0,k], or -1 on error. Their output arrays must
+ * have room for k entries, and CHAR/VECTOR deep copies belong to the caller. */
+static void idydb_query_texts_free(char** texts, unsigned short k)
+{
+	if (!texts) return;
+	for (unsigned short i = 0; i < k; ++i) { free(texts[i]); texts[i] = NULL; }
+}
+
 int idydb_rag_query_topk(idydb **handler,
                          idydb_column_row_sizing text_column,
                          idydb_column_row_sizing vector_column,
@@ -3562,51 +3590,8 @@ int idydb_rag_query_topk(idydb **handler,
                          idydb_knn_result* out_results,
                          char** out_texts)
 {
-  if (!out_results || !out_texts) { idydb_error_state(handler, 8); return -1; }
-
-  for (unsigned short i = 0; i < k; ++i) out_texts[i] = NULL;
-
-  int n = idydb_knn_search_vector_column(handler, vector_column, query_embedding, dims, k, metric, out_results);
-  if (n <= 0) return n;
-
-  for (int i = 0; i < n; ++i) {
-    if (out_results[i].row == 0) { out_texts[i] = NULL; continue; }
-
-    int rc = idydb_extract(handler, text_column, out_results[i].row);
-
-    if (rc == IDYDB_NULL) { out_texts[i] = NULL; continue; }
-    if (rc != IDYDB_DONE) {
-      idydb_error_statef(handler, 18,
-        "rag_query_topk: extract(text) failed col=%llu row=%llu rc=%d",
-        (unsigned long long)text_column,
-        (unsigned long long)out_results[i].row,
-        rc
-      );
-      for (int j = 0; j < i; ++j) { if (out_texts[j]) { free(out_texts[j]); out_texts[j] = NULL; } }
-      return -1;
-    }
-
-    if (idydb_retrieved_type(handler) != IDYDB_CHAR) { out_texts[i] = NULL; continue; }
-
-    char* s = idydb_retrieve_char(handler);
-    if (!s) { out_texts[i] = NULL; continue; }
-
-    size_t len = strlen(s);
-    out_texts[i] = (char*)malloc(len + 1);
-    if (!out_texts[i]) {
-      idydb_error_statef(handler, 24,
-        "rag_query_topk: OOM copying text len=%zu (col=%llu row=%llu)",
-        len,
-        (unsigned long long)text_column,
-        (unsigned long long)out_results[i].row
-      );
-      for (int j = 0; j < i; ++j) { if (out_texts[j]) { free(out_texts[j]); out_texts[j] = NULL; } }
-      return -1;
-    }
-    memcpy(out_texts[i], s, len + 1);
-  }
-
-  return n;
+	return idydb_rag_query_topk_filtered(handler, text_column, vector_column, query_embedding, dims, k, metric,
+		NULL, out_results, out_texts);
 }
 
 int idydb_rag_query_topk_filtered(idydb **handler,
@@ -3620,50 +3605,35 @@ int idydb_rag_query_topk_filtered(idydb **handler,
                                   idydb_knn_result* out_results,
                                   char** out_texts)
 {
-  if (!out_results || !out_texts) { idydb_error_state(handler, 8); return -1; }
-  for (unsigned short i = 0; i < k; ++i) out_texts[i] = NULL;
-
-  int n = idydb_knn_search_vector_column_filtered(handler, vector_column, query_embedding, dims, k, metric, filter, out_results);
-  if (n <= 0) return n;
-
-  for (int i = 0; i < n; ++i) {
-    if (out_results[i].row == 0) { out_texts[i] = NULL; continue; }
-
-    int rc = idydb_extract(handler, text_column, out_results[i].row);
-
-    if (rc == IDYDB_NULL) { out_texts[i] = NULL; continue; }
-    if (rc != IDYDB_DONE) {
-      idydb_error_statef(handler, 18,
-        "rag_query_topk_filtered: extract(text) failed col=%llu row=%llu rc=%d",
-        (unsigned long long)text_column,
-        (unsigned long long)out_results[i].row,
-        rc
-      );
-      for (int j = 0; j < i; ++j) { if (out_texts[j]) { free(out_texts[j]); out_texts[j] = NULL; } }
-      return -1;
-    }
-
-    if (idydb_retrieved_type(handler) != IDYDB_CHAR) { out_texts[i] = NULL; continue; }
-
-    char* s = idydb_retrieve_char(handler);
-    if (!s) { out_texts[i] = NULL; continue; }
-
-    size_t len = strlen(s);
-    out_texts[i] = (char*)malloc(len + 1);
-    if (!out_texts[i]) {
-      idydb_error_statef(handler, 24,
-        "rag_query_topk_filtered: OOM copying text len=%zu (col=%llu row=%llu)",
-        len,
-        (unsigned long long)text_column,
-        (unsigned long long)out_results[i].row
-      );
-      for (int j = 0; j < i; ++j) { if (out_texts[j]) { free(out_texts[j]); out_texts[j] = NULL; } }
-      return -1;
-    }
-    memcpy(out_texts[i], s, len + 1);
-  }
-
-  return n;
+	idydb_query_results_reset(out_results, k);
+	if (out_texts) for (unsigned short i = 0; i < k; ++i) out_texts[i] = NULL;
+	if (!handler || !*handler || !(*handler)->configured || !out_results || !out_texts) {
+		idydb_error_state(handler, 8);
+		return -1;
+	}
+	if (!idydb_query_column_ok(handler, text_column)) { idydb_error_state(handler, 12); return -1; }
+	const int count = idydb_knn_search_vector_column_filtered(handler, vector_column, query_embedding, dims, k, metric,
+		filter, out_results);
+	if (count <= 0) return count;
+	for (int i = 0; i < count; ++i) {
+		const int rc = idydb_extract(handler, text_column, out_results[i].row);
+		if (rc == IDYDB_NULL) continue;
+		if (rc != IDYDB_DONE) goto failure;
+		if (idydb_retrieved_type(handler) != IDYDB_CHAR) { idydb_clear_values(handler); continue; }
+		const char* text = idydb_retrieve_char(handler);
+		if (!text) { idydb_error_state(handler, 18); goto failure; }
+		const size_t length = strlen(text);
+		out_texts[i] = (char*)malloc(length + 1);
+		if (!out_texts[i]) { idydb_error_state(handler, 24); goto failure; }
+		memcpy(out_texts[i], text, length + 1);
+		idydb_clear_values(handler);
+	}
+	return count;
+failure:
+	idydb_clear_values(handler);
+	idydb_query_texts_free(out_texts, k);
+	idydb_query_results_reset(out_results, k);
+	return -1;
 }
 
 int idydb_rag_query_topk_with_metadata(idydb **handler,
@@ -3680,112 +3650,66 @@ int idydb_rag_query_topk_with_metadata(idydb **handler,
                                        char** out_texts,
                                        idydb_value* out_meta)
 {
-	if (!out_results || !out_texts) { idydb_error_state(handler, 8); return -1; }
-	if (meta_columns_count > 0 && (!meta_columns || !out_meta)) { idydb_error_state(handler, 8); return -1; }
-
-	for (unsigned short i = 0; i < k; ++i) out_texts[i] = NULL;
-	if (out_meta && meta_columns_count > 0) {
-		for (size_t i = 0; i < (size_t)k * meta_columns_count; ++i) out_meta[i].type = IDYDB_NULL;
+	idydb_query_results_reset(out_results, k);
+	if (out_texts) for (unsigned short i = 0; i < k; ++i) out_texts[i] = NULL;
+	if (!handler || !*handler || !(*handler)->configured || !out_results || !out_texts || k == 0 ||
+		(meta_columns_count && (!meta_columns || !out_meta || meta_columns_count > SIZE_MAX / k / sizeof(idydb_value)))) {
+		idydb_error_state(handler, 8);
+		return -1;
 	}
+	const size_t metadata_count = (size_t)k * meta_columns_count;
+	if (metadata_count) {
+		memset(out_meta, 0, metadata_count * sizeof(idydb_value));
+		for (size_t i = 0; i < metadata_count; ++i) out_meta[i].type = IDYDB_NULL;
+	}
+	for (size_t j = 0; j < meta_columns_count; ++j)
+		if (!idydb_query_column_ok(handler, meta_columns[j])) { idydb_error_state(handler, 12); return -1; }
 
-	int n = idydb_rag_query_topk_filtered(handler, text_column, vector_column, query_embedding, dims, k, metric,
-	                                     filter, out_results, out_texts);
-	if (n <= 0) return n;
-
-	if (!out_meta || meta_columns_count == 0) return n;
-
-	for (int i = 0; i < n; ++i)
-	{
-		if (out_results[i].row == 0) continue;
-		for (size_t j = 0; j < meta_columns_count; ++j)
-		{
-			const size_t idx = (size_t)i * meta_columns_count + j;
-			idydb_value* v = &out_meta[idx];
-			v->type = IDYDB_NULL;
-
-			int rc = idydb_extract(handler, meta_columns[j], out_results[i].row);
-			if (rc == IDYDB_NULL) { v->type = IDYDB_NULL; continue; }
-			if (rc != IDYDB_DONE) {
-				idydb_error_statef(handler, 18,
-					"rag_query_topk_with_metadata: extract(meta) failed meta_col=%llu row=%llu rc=%d",
-					(unsigned long long)meta_columns[j],
-					(unsigned long long)out_results[i].row,
-					rc
-				);
-				return -1;
-			}
-
-			unsigned char t = (unsigned char)idydb_retrieved_type(handler);
-			v->type = t;
-
-			switch (t)
-			{
-				case IDYDB_INTEGER:
-					v->as.i = idydb_retrieve_int(handler);
-					break;
-				case IDYDB_FLOAT:
-					v->as.f = idydb_retrieve_float(handler);
-					break;
-				case IDYDB_BOOL:
-					v->as.b = idydb_retrieve_bool(handler);
-					break;
-				case IDYDB_CHAR:
-				{
-					char* s = idydb_retrieve_char(handler);
-					if (!s) { v->type = IDYDB_NULL; break; }
-
-					size_t len = strlen(s);
-					v->as.s = (char*)malloc(len + 1);
-					if (!v->as.s) {
-						idydb_error_statef(handler, 24,
-							"rag_query_topk_with_metadata: OOM copying CHAR meta col=%llu row=%llu len=%zu",
-							(unsigned long long)meta_columns[j],
-							(unsigned long long)out_results[i].row,
-							len
-						);
-						v->type = IDYDB_NULL;
-						idydb_clear_values(handler); /* important: cleanup handler temp state */
-						return -1;
-					}
-
-					memcpy(v->as.s, s, len + 1);
+	const int count = idydb_rag_query_topk_filtered(handler, text_column, vector_column, query_embedding, dims, k, metric,
+		filter, out_results, out_texts);
+	if (count <= 0 || !metadata_count) return count;
+	for (int i = 0; i < count; ++i) {
+		for (size_t j = 0; j < meta_columns_count; ++j) {
+			idydb_value* value = &out_meta[(size_t)i * meta_columns_count + j];
+			const int rc = idydb_extract(handler, meta_columns[j], out_results[i].row);
+			if (rc == IDYDB_NULL) continue;
+			if (rc != IDYDB_DONE) goto failure;
+			value->type = (unsigned char)idydb_retrieved_type(handler);
+			switch (value->type) {
+				case IDYDB_INTEGER: value->as.i = idydb_retrieve_int(handler); break;
+				case IDYDB_FLOAT: value->as.f = idydb_retrieve_float(handler); break;
+				case IDYDB_BOOL: value->as.b = idydb_retrieve_bool(handler); break;
+				case IDYDB_CHAR: {
+					const char* text = idydb_retrieve_char(handler);
+					if (!text) { idydb_error_state(handler, 18); goto failure; }
+					const size_t length = strlen(text);
+					value->as.s = (char*)malloc(length + 1);
+					if (!value->as.s) { idydb_error_state(handler, 24); goto failure; }
+					memcpy(value->as.s, text, length + 1);
 					break;
 				}
-				case IDYDB_VECTOR:
-				{
-					unsigned short vd = 0;
-					const float* pv = idydb_retrieve_vector(handler, &vd);
-					if (!pv || vd == 0) { v->type = IDYDB_NULL; break; }
-
-					v->as.vec.dims = vd;
-					v->as.vec.v = (float*)malloc(sizeof(float) * (size_t)vd);
-					if (!v->as.vec.v) {
-						idydb_error_statef(handler, 24,
-							"rag_query_topk_with_metadata: OOM copying VECTOR meta col=%llu row=%llu dims=%u",
-							(unsigned long long)meta_columns[j],
-							(unsigned long long)out_results[i].row,
-							(unsigned)vd
-						);
-						v->type = IDYDB_NULL;
-						v->as.vec.dims = 0;
-						idydb_clear_values(handler); /* important: frees handler->vector_value if allocated */
-						return -1;
-					}
-
-					memcpy(v->as.vec.v, pv, sizeof(float) * (size_t)vd);
+				case IDYDB_VECTOR: {
+					unsigned short vector_dims = 0;
+					const float* vector = idydb_retrieve_vector(handler, &vector_dims);
+					if (!vector || vector_dims == 0) { idydb_error_state(handler, 18); goto failure; }
+					value->as.vec.dims = vector_dims;
+					value->as.vec.v = (float*)malloc((size_t)vector_dims * sizeof(float));
+					if (!value->as.vec.v) { idydb_error_state(handler, 24); goto failure; }
+					memcpy(value->as.vec.v, vector, (size_t)vector_dims * sizeof(float));
 					break;
 				}
-				default:
-					v->type = IDYDB_NULL;
-					break;
+				default: value->type = IDYDB_NULL; break;
 			}
-
-			/* important: avoid keeping extracted VECTOR allocated on handler */
 			idydb_clear_values(handler);
 		}
 	}
-
-	return n;
+	return count;
+failure:
+	idydb_clear_values(handler);
+	idydb_query_texts_free(out_texts, k);
+	idydb_values_free(out_meta, metadata_count);
+	idydb_query_results_reset(out_results, k);
+	return -1;
 }
 
 int idydb_rag_query_context(idydb **handler,
@@ -3798,37 +3722,8 @@ int idydb_rag_query_context(idydb **handler,
                             size_t max_chars,
                             char** out_context)
 {
-	if (!out_context) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
-	idydb_knn_result* res = (idydb_knn_result*)calloc(k, sizeof(idydb_knn_result));
-	char** texts = (char**)calloc(k, sizeof(char*));
-	if (!res || !texts) { if (res) free(res); if (texts) free(texts); idydb_error_state(handler, 24); return IDYDB_ERROR; }
-	int n = idydb_rag_query_topk(handler, text_column, vector_column, query_embedding, dims, k, metric, res, texts);
-	if (n <= 0) { free(res); free(texts); return (n == 0 ? IDYDB_DONE : IDYDB_ERROR); }
-	size_t total = 0;
-	const char* sep = "\n---\n";
-	size_t sep_len = strlen(sep);
-	for (int i = 0; i < n; ++i) { if (texts[i]) total += strlen(texts[i]); if (i+1 < n) total += sep_len; }
-	if (max_chars > 0 && total > max_chars) total = max_chars;
-	char* buf = (char*)malloc(total + 1);
-	if (!buf) { for (int i=0;i<n;++i) if (texts[i]) free(texts[i]); free(res); free(texts); idydb_error_state(handler, 24); return IDYDB_ERROR; }
-	size_t written = 0;
-	for (int i = 0; i < n; ++i) {
-		if (!texts[i]) continue;
-		size_t len = strlen(texts[i]);
-		if (max_chars > 0 && written + len > max_chars) len = max_chars - written;
-		memcpy(buf + written, texts[i], len);
-		written += len;
-		if (i+1 < n) {
-			if (max_chars > 0 && written + sep_len > max_chars) break;
-			memcpy(buf + written, sep, sep_len);
-			written += sep_len;
-		}
-	}
-	buf[written] = '\0';
-	for (int i=0;i<n;++i) if (texts[i]) free(texts[i]);
-	free(res); free(texts);
-	*out_context = buf;
-	return IDYDB_DONE;
+	return idydb_rag_query_context_filtered(handler, text_column, vector_column, query_embedding, dims, k, metric,
+		NULL, max_chars, out_context);
 }
 
 int idydb_rag_query_context_filtered(idydb **handler,
@@ -3843,38 +3738,70 @@ int idydb_rag_query_context_filtered(idydb **handler,
                                      char** out_context)
 {
 	if (!out_context) { idydb_error_state(handler, 8); return IDYDB_ERROR; }
-	idydb_knn_result* res = (idydb_knn_result*)calloc(k, sizeof(idydb_knn_result));
-	char** texts = (char**)calloc(k, sizeof(char*));
-	if (!res || !texts) { if (res) free(res); if (texts) free(texts); idydb_error_state(handler, 24); return IDYDB_ERROR; }
-
-	int n = idydb_rag_query_topk_filtered(handler, text_column, vector_column, query_embedding, dims, k, metric, filter, res, texts);
-	if (n <= 0) { free(res); free(texts); return (n == 0 ? IDYDB_DONE : IDYDB_ERROR); }
-
-	size_t total = 0;
-	const char* sep = "\n---\n";
-	size_t sep_len = strlen(sep);
-	for (int i = 0; i < n; ++i) { if (texts[i]) total += strlen(texts[i]); if (i+1 < n) total += sep_len; }
-	if (max_chars > 0 && total > max_chars) total = max_chars;
-	char* buf = (char*)malloc(total + 1);
-	if (!buf) { for (int i=0;i<n;++i) if (texts[i]) free(texts[i]); free(res); free(texts); idydb_error_state(handler, 24); return IDYDB_ERROR; }
-
-	size_t written = 0;
-	for (int i = 0; i < n; ++i) {
-		if (!texts[i]) continue;
-		size_t len = strlen(texts[i]);
-		if (max_chars > 0 && written + len > max_chars) len = max_chars - written;
-		memcpy(buf + written, texts[i], len);
-		written += len;
-		if (i+1 < n) {
-			if (max_chars > 0 && written + sep_len > max_chars) break;
-			memcpy(buf + written, sep, sep_len);
-			written += sep_len;
-		}
+	*out_context = NULL;
+	if (!handler || !*handler || !(*handler)->configured || k == 0) {
+		idydb_error_state(handler, 8);
+		return IDYDB_ERROR;
 	}
-	buf[written] = '\0';
-	for (int i=0;i<n;++i) if (texts[i]) free(texts[i]);
-	free(res); free(texts);
-	*out_context = buf;
+	idydb_knn_result* results = (idydb_knn_result*)calloc(k, sizeof(idydb_knn_result));
+	char** texts = (char**)calloc(k, sizeof(char*));
+	if (!results || !texts) {
+		free(results); free(texts);
+		idydb_error_state(handler, 24);
+		return IDYDB_ERROR;
+	}
+	const int count = idydb_rag_query_topk_filtered(handler, text_column, vector_column, query_embedding, dims, k, metric,
+		filter, results, texts);
+	if (count <= 0) {
+		free(results); free(texts);
+		if (count < 0) return IDYDB_ERROR;
+		*out_context = (char*)malloc(1);
+		if (!*out_context) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
+		(*out_context)[0] = '\0';
+		return IDYDB_DONE;
+	}
+
+	const char separator[] = "\n---\n";
+	const size_t separator_length = sizeof(separator) - 1;
+	size_t total = 0;
+	int text_count = 0;
+	for (int i = 0; i < count; ++i) {
+		if (!texts[i]) continue;
+		const size_t length = strlen(texts[i]);
+		const size_t padding = text_count++ ? separator_length : 0;
+		if (length > SIZE_MAX - 1 - padding || total > SIZE_MAX - 1 - padding - length) {
+			idydb_query_texts_free(texts, k); free(results); free(texts);
+			idydb_error_state(handler, 24);
+			return IDYDB_ERROR;
+		}
+		total += padding + length;
+	}
+	if (max_chars && total > max_chars) total = max_chars;
+	char* context = (char*)malloc(total + 1);
+	if (!context) {
+		idydb_query_texts_free(texts, k); free(results); free(texts);
+		idydb_error_state(handler, 24);
+		return IDYDB_ERROR;
+	}
+	size_t written = 0;
+	text_count = 0;
+	for (int i = 0; i < count && written < total; ++i) {
+		if (!texts[i]) continue;
+		if (text_count++) {
+			size_t length = separator_length;
+			if (length > total - written) length = total - written;
+			memcpy(context + written, separator, length);
+			written += length;
+		}
+		size_t length = strlen(texts[i]);
+		if (length > total - written) length = total - written;
+		memcpy(context + written, texts[i], length);
+		written += length;
+	}
+	context[written] = '\0';
+	idydb_query_texts_free(texts, k);
+	free(results); free(texts);
+	*out_context = context;
 	return IDYDB_DONE;
 }
 /* ---------------- undefines mirroring original ---------------- */

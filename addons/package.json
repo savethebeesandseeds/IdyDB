@@ -1,0 +1,23 @@
+{
+  "name": "idydb-addon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node-API bindings for the local IdyDB C++ library",
+  "main": "build/Release/idydb.node",
+  "gypfile": true,
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test": "node --expose-gc test.js",
+    "test:failure": "node --expose-gc test-failure.js"
+  },
+  "engines": {
+    "node": ">=20.5.0"
+  },
+  "dependencies": {
+    "node-addon-api": "8.5.0"
+  },
+  "devDependencies": {
+    "node-gyp": "11.4.2"
+  }
+}

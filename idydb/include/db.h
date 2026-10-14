@@ -22,7 +22,8 @@
   #define IDYDB_API
 #endif
 
-#define CUWACUNU_CAMAHJUCUNU_DB_VERBOSE_DEBUG 1 // enable debug mode
+/* Debug logging is opt-in: define CUWACUNU_CAMAHJUCUNU_DB_VERBOSE_DEBUG
+ * when compiling the implementation. Leave it undefined in normal builds. */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -53,10 +54,30 @@
 #define IDYDB_SIZING_MODE_BIG   3 // Handle databases up to 281.47 terabytes in size
 
 // Database memory mapping
-#define IDYDB_MMAP_ALLOWED 1 // Allows the database to memory map files - if possible (1 - allowed, 0 - disallowed)
+#ifndef IDYDB_MMAP_ALLOWED
+#define IDYDB_MMAP_ALLOWED 1 // 1 permits read-only mmap where supported; 0 disables it.
+#endif
 
 // Database sizing selection
-#define IDYDB_SIZING_MODE IDYDB_SIZING_MODE_BIG // The sizing mode for this compilation
+#ifndef IDYDB_SIZING_MODE
+#define IDYDB_SIZING_MODE IDYDB_SIZING_MODE_BIG
+#endif
+
+/* 1-based row/column bounds, inclusive. The on-disk positions use uint16;
+ * BIG does not provide arbitrary uint64 row/column identifiers. All consumers
+ * must use the same sizing mode as the compiled library. */
+#if IDYDB_SIZING_MODE == IDYDB_SIZING_MODE_TINY
+#define IDYDB_MAX_POSITION 16u
+#elif IDYDB_SIZING_MODE == IDYDB_SIZING_MODE_SMALL
+#define IDYDB_MAX_POSITION 256u
+#elif IDYDB_SIZING_MODE == IDYDB_SIZING_MODE_BIG
+#define IDYDB_MAX_POSITION 65536u
+#else
+#error Invalid IDYDB_SIZING_MODE
+#endif
+
+#define IDYDB_MAX_VECTOR_DIMENSIONS 16383u
+#define IDYDB_MAX_TEXT_BYTES 65532u /* excludes the terminating NUL */
 
 #ifdef __cplusplus
 #define idydb_extern extern "C" IDYDB_API
@@ -82,7 +103,13 @@ typedef struct idydb_open_options {
 } idydb_open_options;
 
 /**
- * @brief Unified runtime open entrypoint
+ * @brief Unified runtime open entrypoint.
+ * Initialize *handler to NULL. Close an existing handler before reopening it.
+ * Returns IDYDB_SUCCESS on success; otherwise an IDYDB_* error status.
+ * A failed open may leave a handler for error reporting: read idydb_errmsg,
+ * then call idydb_discard. filename/options/passphrase are borrowed for this call.
+ * flags may combine IDYDB_CREATE, IDYDB_READONLY and IDYDB_UNSAFE; 0 opens an
+ * existing file writable. Encryption is persisted on explicit flush or close.
  */
 idydb_extern int idydb_open_with_options(const char *filename, idydb **handler, const idydb_open_options* options);
 
@@ -92,22 +119,60 @@ idydb_extern int idydb_open_with_options(const char *filename, idydb **handler, 
 idydb_extern int idydb_open(const char *filename, idydb **handler, int flags);
 
 /**
+ * @brief Open a plaintext database relative to an existing POSIX directory fd.
+ * directory_fd must be readable and support directory sync; open it using
+ * O_RDONLY | O_DIRECTORY. Linux O_PATH descriptors are rejected before open.
+ * filename must be a basename (no slash, empty name, ".", or ".."). Symlinks
+ * and non-regular files are refused. The library owns a duplicate of directory_fd;
+ * the caller may close its fd after this call. Staging, atomic replacement and
+ * directory sync stay relative to that pinned directory even if it is renamed.
+ * Uses the same flags/status/failed-open cleanup contract as idydb_open.
+ * Returns IDYDB_ERROR on Windows, where directory-fd access is unsupported.
+ */
+idydb_extern int idydb_open_at(int directory_fd, const char *filename, idydb **handler, int flags);
+
+/**
  * @brief Open an encrypted-at-rest database (AES-256-GCM + PBKDF2-HMAC-SHA256 via OpenSSL).
  */
 idydb_extern int idydb_open_encrypted(const char *filename, idydb **handler, int flags, const char* passphrase);
 
 /**
- * @brief Close the connection to the database, and delete the IdyDB handler object
+ * @brief Persist pending changes without closing the database or releasing its lock.
+ * Returns IDYDB_DONE on success, including for a read-only handler.
+ * Encrypted changes remain in memory until flush or close succeeds.
+ * On failure the handler remains open for inspection, retry, or discard.
+ * A directory-sync error may occur after replacement is already visible.
+ * Persistence guarantees depend on the operating system and filesystem.
+ */
+idydb_extern int idydb_flush(idydb **handler);
+
+/**
+ * @brief Close the database and set *handler to NULL.
+ * Returns IDYDB_DONE on success, or an error if encrypted writeback fails.
+ * Always check this status: encrypted changes are persisted here.
+ * On a writeback/flush failure the handler stays open for inspection and retry.
+ * A directory-sync error may occur after replacement is already visible.
  */
 idydb_extern int idydb_close(idydb **handler);
 
 /**
- * @brief Return the current version of the IdyDB API
+ * @brief Release the handler and its lock without persisting pending changes.
+ * Sets *handler to NULL and returns IDYDB_DONE; a NULL handler is also accepted.
+ * Use after a failed close when retrying persistence is no longer desired.
+ * Discards uncommitted encrypted changes. Completed plaintext commits and an
+ * already-visible replacement after a directory-sync error cannot be undone.
  */
-idydb_extern unsigned int idydb_version_check();
+idydb_extern int idydb_discard(idydb **handler);
 
 /**
- * @brief Retrieve an error message from the IdyDB handler if once exists
+ * @brief Return the current version of the IdyDB API
+ */
+idydb_extern unsigned int idydb_version_check(void);
+
+/**
+ * @brief Retrieve the handler's last error message.
+ * The returned string is borrowed; do not free or modify it. It is valid until
+ * the next operation changing the error state or until the handler is closed.
  */
 idydb_extern char* idydb_errmsg(idydb **handler);
 
@@ -122,6 +187,12 @@ idydb_extern int idydb_extract(idydb **handler, idydb_column_row_sizing column_p
  */
 idydb_extern int idydb_retrieved_type(idydb **handler);
 
+/* Primitive inserts and deletes prepare a copy before committing the change.
+ * Plaintext success atomically replaces the backing file; encrypted success
+ * replaces the in-memory state, persisted by flush or close. A failure before
+ * replacement leaves the prior state intact. A directory-sync error may be
+ * reported after replacement is visible. Durability depends on the filesystem.
+ */
 idydb_extern int idydb_insert_int(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position, int value);
 idydb_extern int idydb_insert_float(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position, float value);
 idydb_extern int idydb_insert_char(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position, char* value);
@@ -132,7 +203,8 @@ idydb_extern int idydb_insert_bool(idydb **handler, idydb_column_row_sizing colu
  * @brief Insert a vector<float> (embedding)
  *
  * Layout on disk: [type=6][uint16 dims][dims * float32 bytes]
- * @param dims must be <= 16383
+ * @param dims must be in [1, IDYDB_MAX_VECTOR_DIMENSIONS]. data contains dims
+ * finite float32 elements and is borrowed only for this call.
  */
 idydb_extern int idydb_insert_vector(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position, const float* data, unsigned short dims);
 
@@ -142,7 +214,10 @@ idydb_extern int idydb_insert_vector(idydb **handler, idydb_column_row_sizing co
 idydb_extern int idydb_delete(idydb **handler, idydb_column_row_sizing column_position, idydb_column_row_sizing row_position);
 
 /**
- * @brief Retrieve primitives from the last extracted value
+ * @brief Retrieve primitives from the last extracted value.
+ * idydb_retrieve_char returns a borrowed internal string. Do not free or modify
+ * it; copy it before the next extract/insert/delete/close on this handler.
+ * Text inputs are NUL-terminated strings of at most IDYDB_MAX_TEXT_BYTES bytes.
  */
 idydb_extern int   idydb_retrieve_int(idydb **handler);
 idydb_extern float idydb_retrieve_float(idydb **handler);
@@ -162,7 +237,7 @@ typedef enum { IDYDB_SIM_COSINE = 1, IDYDB_SIM_L2 = 2 } idydb_similarity_metric;
 
 typedef struct {
     idydb_column_row_sizing row; // 1-based row index
-    float score;                 // higher is better
+    float score;                 // higher is better; L2 is negative Euclidean distance, clamped to float range
 } idydb_knn_result;
 
 /* --------------------------- Query Filters + Metadata --------------------------- */
@@ -214,6 +289,13 @@ idydb_extern void idydb_free(void* p);
 idydb_extern void idydb_value_free(idydb_value* v);
 idydb_extern void idydb_values_free(idydb_value* values, size_t count);
 
+/* kNN functions return n in [0,k] on success (including 0 for no hits), or -1
+ * on error. k is in [1,65535]; dims is in [1,IDYDB_MAX_VECTOR_DIMENSIONS].
+ * out_results must provide k slots; only the first n are hits. query contains
+ * dims finite float32 values. Inputs and output buffers are borrowed for the
+ * duration of the synchronous call. Filters AND all terms; a NULL filter means
+ * all rows. Filter terms and CHAR comparison strings are borrowed. */
+
 idydb_extern int idydb_knn_search_vector_column(idydb **handler,
                                                 idydb_column_row_sizing vector_column,
                                                 const float* query,
@@ -232,9 +314,14 @@ idydb_extern int idydb_knn_search_vector_column_filtered(idydb **handler,
                                                         const idydb_filter* filter,
                                                         idydb_knn_result* out_results);
 
- 
+/* Returns the next unused row after the highest stored row, 1 for an empty
+ * column, or 0 on error/full column. Gaps before the highest row are not reused. */
 idydb_extern idydb_column_row_sizing idydb_column_next_row(idydb **handler, idydb_column_row_sizing column);
 
+/* Stores text and embedding in different columns at the same row, committing
+ * both changes together. Validates all inputs before preparing the update.
+ * Uses the same atomic replacement and persistence rules as primitive writes.
+ * A directory-sync error may be reported after both changes are visible. */
 idydb_extern int idydb_rag_upsert_text(idydb **handler,
                                        idydb_column_row_sizing text_column,
                                        idydb_column_row_sizing vector_column,
@@ -243,6 +330,10 @@ idydb_extern int idydb_rag_upsert_text(idydb **handler,
                                        const float* embedding,
                                        unsigned short dims);
 
+/* Return 0 on success with a malloc-compatible *out_vector and valid *out_dims.
+ * IdyDB owns and frees the returned vector after the callback, including a
+ * non-NULL vector returned on error. text/user are borrowed; the callback and
+ * user pointer must remain valid until replaced or the handler is closed. */
 typedef int (*idydb_embed_fn)(const char* text, float** out_vector, unsigned short* out_dims, void* user);
 
 idydb_extern void idydb_set_embedder(idydb **handler, idydb_embed_fn fn, void* user);
@@ -253,6 +344,11 @@ idydb_extern int idydb_rag_upsert_text_auto_embed(idydb **handler,
                                                   idydb_column_row_sizing row,
                                                   const char* text);
 
+/* TopK functions use the kNN count convention: n in [0,k], or -1 on error.
+ * out_results and out_texts each provide k slots. Returned text strings are
+ * heap copies; initialize text slots to NULL and free every non-NULL slot with
+ * idydb_free, even after an error. Never pass borrowed retrieve_char strings to
+ * idydb_free. Missing text cells yield NULL text without dropping the hit. */
 idydb_extern int idydb_rag_query_topk(idydb **handler,
                                       idydb_column_row_sizing text_column,
                                       idydb_column_row_sizing vector_column,
@@ -278,6 +374,9 @@ idydb_extern int idydb_rag_query_topk_filtered(idydb **handler,
  * out_meta is a flat array of size (k * meta_columns_count).
  * Indexing: out_meta[i*meta_columns_count + j] corresponds to result i, meta column j.
  * Caller frees CHAR/VECTOR in out_meta via idydb_values_free(out_meta, k*meta_columns_count).
+ * Initialize metadata to IDYDB_NULL. Free all text and metadata slots after an
+ * error as well as success. The caller owns the arrays themselves; the free
+ * helpers release their members, not the arrays. Missing metadata is IDYDB_NULL.
  */
 idydb_extern int idydb_rag_query_topk_with_metadata(idydb **handler,
                                                    idydb_column_row_sizing text_column,
@@ -293,6 +392,11 @@ idydb_extern int idydb_rag_query_topk_with_metadata(idydb **handler,
                                                    char** out_texts,
                                                    idydb_value* out_meta);
 
+/* Context functions return IDYDB_DONE or an IDYDB_* error status, not a count.
+ * On success *out_context is an owned NUL-terminated string, including an
+ * empty string for no hits. Free it with idydb_free. On error it is NULL.
+ * max_chars limits bytes (UTF-8 may be split); 0 means unlimited.
+ * Initialize *out_context to NULL before the call. */
 idydb_extern int idydb_rag_query_context(idydb **handler,
                                          idydb_column_row_sizing text_column,
                                          idydb_column_row_sizing vector_column,
@@ -325,8 +429,11 @@ using ::idydb_open_options;
 
 using ::idydb_open_with_options;
 using ::idydb_open;
+using ::idydb_open_at;
 using ::idydb_open_encrypted;
+using ::idydb_flush;
 using ::idydb_close;
+using ::idydb_discard;
 using ::idydb_version_check;
 using ::idydb_errmsg;
 using ::idydb_extract;
