@@ -1,5 +1,6 @@
 #include "db.h"
 #include "failure_hooks.h"
+#include "test_process.h"
 
 #include <cerrno>
 #include <chrono>
@@ -12,19 +13,30 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
-
 namespace {
 namespace fs = std::filesystem;
+fs::path test_executable;
 
 void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-std::string bytes(const fs::path& path) {
+std::string bytes(const fs::path& path, idydb** live = nullptr) {
+#if defined(_WIN32)
+    // Windows byte-range locks deliberately reject reads through a second
+    // handle. Inspect backing bytes through the writer's existing handle.
+    if (live && *live) {
+        unsigned char* data = nullptr;
+        size_t size = 0;
+        check(idydb_test_backing_snapshot(live, &data, &size) == IDYDB_DONE,
+              "cannot inspect locked backing image");
+        std::string result(reinterpret_cast<char*>(data), size);
+        idydb_free(data);
+        return result;
+    }
+#else
+    (void)live;
+#endif
     std::ifstream stream(path, std::ios::binary);
     check(stream.is_open(), "cannot read fixture " + path.string());
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
@@ -53,7 +65,7 @@ struct Handle {
         options.encrypted_at_rest = encrypted;
         options.passphrase = encrypted ? "failure-test-secret" : nullptr;
         options.pbkdf2_iter = 10000;
-        const int status = idydb_open_with_options(path.string().c_str(), &value, &options);
+        const int status = idydb_open_with_options(path.u8string().c_str(), &value, &options);
         check(status == IDYDB_SUCCESS, "fixture open: " + std::string(idydb_errmsg(&value)));
     }
     void close() {
@@ -167,7 +179,7 @@ void test_mutation_failures(Files& files, bool encrypted) {
                 injection.require_fired("RAG upsert");
                 injection.reset();
             }
-            check(bytes(path) == saved, "failed RAG upsert changed persisted bytes");
+            check(bytes(path, &handle.value) == saved, "failed RAG upsert changed persisted bytes");
             require_pair(handle, 1, old_text, old_vector);
             require_absent_pair(handle, 2);
             require_marker(handle);
@@ -201,12 +213,41 @@ void test_plain_commit_failures(Files& files) {
             injection.require_fired("plaintext commit");
             injection.reset();
         }
-        check(bytes(path) == saved, "failed plaintext commit changed bytes");
+        check(bytes(path, &handle.value) == saved, "failed plaintext commit changed bytes");
         require_pair(handle, 1, old_text, old_vector);
         require_marker(handle);
         check(idydb_rag_upsert_text(&handle.value, 1, 2, 1, new_text, new_vector, 2) == IDYDB_DONE,
               "plaintext commit retry failed");
         handle.close();
+        files.require_no_staging();
+    }
+}
+
+void test_plain_failure_authoritative_path(Files& files) {
+    // Inspect the pathname independently after releasing the failed writer.
+    // A snapshot of its retained descriptor alone would miss a replacement
+    // published to the pathname without adopting that replacement handle.
+    for (int stage : {IDYDB_TEST_CELL_WRITE, IDYDB_TEST_FILE_SYNC, IDYDB_TEST_REPLACE}) {
+        const fs::path path = files.next();
+        create_fixture(path, false);
+        const std::string saved = bytes(path);
+        Handle handle;
+        handle.open(path, false);
+        {
+            Injection injection(stage, stage == IDYDB_TEST_CELL_WRITE ? 2 : 1, EIO);
+            check(idydb_rag_upsert_text(&handle.value, 1, 2, 1, new_text, new_vector, 2) != IDYDB_DONE,
+                  "authoritative-path fixture accepted injected failure");
+            injection.require_fired("authoritative-path pre-replacement failure");
+            injection.reset();
+        }
+        handle.discard();
+        check(bytes(path) == saved, "failed mutation changed authoritative pathname bytes");
+        Handle reopened;
+        reopened.open(path, false, IDYDB_READONLY);
+        require_pair(reopened, 1, old_text, old_vector);
+        require_absent_pair(reopened, 2);
+        require_marker(reopened);
+        reopened.close();
         files.require_no_staging();
     }
 }
@@ -243,7 +284,7 @@ void test_staged_primitive_failures(Files& files, bool encrypted) {
                     injection.require_fired("staged primitive " + std::to_string(cell));
                     injection.reset();
                 }
-                check(bytes(path) == saved, "staged primitive failure changed backing image");
+                check(bytes(path, &handle.value) == saved, "staged primitive failure changed backing image");
                 require_pair(handle, 1, initial, old_vector);
                 require_marker(handle);
                 check(idydb_rag_upsert_text(&handle.value, 1, 2, 1, replacement, new_vector, 2) == IDYDB_DONE,
@@ -289,7 +330,7 @@ void test_borrowed_rag_inputs(Files& files, bool encrypted) {
             injection.require_fired("borrowed-input RAG");
             injection.reset();
         }
-        check(bytes(path) == saved, "borrowed-input RAG failure changed bytes");
+        check(bytes(path, &handle.value) == saved, "borrowed-input RAG failure changed bytes");
         require_pair(handle, 1, old_text, old_vector);
         require_absent_pair(handle, 2);
         borrow();
@@ -318,7 +359,7 @@ void test_failed_delete(Files& files) {
         injection.require_fired("delete");
         injection.reset();
     }
-    check(bytes(path) == saved, "failed delete changed bytes");
+    check(bytes(path, &handle.value) == saved, "failed delete changed bytes");
     require_pair(handle, 1, old_text, old_vector);
     require_marker(handle);
     check(idydb_delete(&handle.value, 1, 1) == IDYDB_DONE, "delete retry failed");
@@ -333,7 +374,7 @@ void require_locked(const fs::path& path, bool encrypted) {
     options.encrypted_at_rest = encrypted;
     options.passphrase = encrypted ? "failure-test-secret" : nullptr;
     options.pbkdf2_iter = 10000;
-    const int status = idydb_open_with_options(path.string().c_str(), &competing, &options);
+    const int status = idydb_open_with_options(path.u8string().c_str(), &competing, &options);
     check(idydb_discard(&competing) == IDYDB_DONE, "competing handle cleanup failed");
     check(status == IDYDB_BUSY, "failed persistence released the live writer lock");
 }
@@ -374,7 +415,7 @@ void test_encrypted_persistence_failures(Files& files) {
             handle.open(path, true);
             check(idydb_rag_upsert_text(&handle.value, 1, 2, 1, new_text, new_vector, 2) == IDYDB_DONE,
                   "pending encrypted upsert failed");
-            check(bytes(path) == saved, "encrypted upsert persisted before flush");
+            check(bytes(path, &handle.value) == saved, "encrypted upsert persisted before flush");
             idydb* original = handle.value;
             {
                 Injection injection(failure.stage, failure.occurrence, failure.error);
@@ -384,7 +425,7 @@ void test_encrypted_persistence_failures(Files& files) {
                 injection.reset();
             }
             check(handle.value == original, "failed persistence discarded live handle");
-            check(bytes(path) == saved, "failed encrypted persistence changed bytes");
+            check(bytes(path, &handle.value) == saved, "failed encrypted persistence changed bytes");
             require_pair(handle, 1, new_text, new_vector);
             require_marker(handle);
             require_locked(path, true);
@@ -412,7 +453,7 @@ void test_plain_failed_close_cleanup(Files& files) {
             handle.open(path, false);
             check(idydb_rag_upsert_text(&handle.value, 1, 2, 1, new_text, new_vector, 2) == IDYDB_DONE,
                   "plaintext cleanup fixture mutation failed");
-            const std::string committed = bytes(path);
+            const std::string committed = bytes(path, &handle.value);
             idydb* original = handle.value;
             {
                 Injection injection(stage);
@@ -449,9 +490,9 @@ void test_encrypted_retry(Files& files) {
         injection.require_fired("encrypted retry close");
         injection.reset();
     }
-    check(handle.value == original && bytes(path) == saved, "encrypted failed close lost retry state");
+    check(handle.value == original && bytes(path, &handle.value) == saved, "encrypted failed close lost retry state");
     check(idydb_flush(&handle.value) == IDYDB_DONE, "encrypted flush retry failed");
-    check(handle.value == original && bytes(path) != saved, "encrypted flush retry lost its handle or update");
+    check(handle.value == original && bytes(path, &handle.value) != saved, "encrypted flush retry lost its handle or update");
     require_locked(path, true);
     check(idydb_rag_upsert_text(&handle.value, 1, 2, 2, new_text, new_vector, 2) == IDYDB_DONE,
           "encrypted mutation after retry failed");
@@ -483,7 +524,7 @@ void test_post_replacement_failure(Files& files, bool encrypted) {
         injection.require_fired("replacement directory sync");
         injection.reset();
     }
-    check(bytes(path) != saved, "directory-sync failure did not occur after replacement");
+    check(bytes(path, &handle.value) != saved, "directory-sync failure did not occur after replacement");
     require_pair(handle, 1, new_text, new_vector);
     require_marker(handle);
     require_locked(path, encrypted);
@@ -510,7 +551,7 @@ void test_plain_directory_sync_retry(Files& files) {
         injection.require_fired("plaintext commit directory sync");
         injection.reset();
     }
-    const std::string committed = bytes(path);
+    const std::string committed = bytes(path, &handle.value);
     check(committed != saved, "plaintext directory-sync failure occurred before replacement");
     check(handle.value == original, "post-replacement failure discarded plaintext handle");
     require_pair(handle, 1, new_text, new_vector);
@@ -527,7 +568,7 @@ void test_plain_directory_sync_retry(Files& files) {
                                       "plaintext retry flush directory sync");
         injection.reset();
         check(handle.value == original, "directory-sync retry discarded plaintext handle");
-        check(bytes(path) == committed, "directory-sync retry rewrote committed plaintext bytes");
+        check(bytes(path, &handle.value) == committed, "directory-sync retry rewrote committed plaintext bytes");
         require_pair(handle, 1, new_text, new_vector);
         require_marker(handle);
         require_locked(path, false);
@@ -579,11 +620,10 @@ void test_flush_and_discard(Files& files) {
     }
 }
 
-#if !defined(_WIN32)
 struct Crash {
     int stage;
     static int callback(int point, void* context) {
-        if (point == static_cast<Crash*>(context)->stage) _exit(91);
+        if (point == static_cast<Crash*>(context)->stage) idydb_test::crash_exit(91);
         return 0;
     }
 };
@@ -603,22 +643,9 @@ void test_interrupted_commit(Files& files, bool encrypted, bool after) {
         expected.close();
         expected_new = bytes(expected_path);
     }
-    const pid_t child = fork();
-    check(child >= 0, "fork failed");
-    if (child == 0) {
-        try {
-            Handle handle;
-            handle.open(path, encrypted);
-            Crash crash = {after ? IDYDB_TEST_AFTER_REPLACE : IDYDB_TEST_BEFORE_REPLACE};
-            idydb_test_set_hook(Crash::callback, &crash);
-            const int status = idydb_rag_upsert_text(&handle.value, 1, 2, 1, new_text, new_vector, 2);
-            if (encrypted && status == IDYDB_DONE) idydb_flush(&handle.value);
-            _exit(92);
-        } catch (...) { _exit(93); }
-    }
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0) check(errno == EINTR, "waitpid failed");
-    check(WIFEXITED(status) && WEXITSTATUS(status) == 91, "commit did not reach crash boundary");
+    const int status = idydb_test::child(test_executable, {"--crash-child",
+        idydb_test::hex(path.u8string()), encrypted ? "1" : "0", after ? "1" : "0"});
+    check(status == 91, "commit did not reach crash boundary: " + std::to_string(status));
     check(after ? bytes(path) != saved : bytes(path) == saved, "interruption changed the wrong file image");
     if (after && !encrypted) check(bytes(path) == expected_new, "interruption exposed an incomplete new image");
     Handle reopened;
@@ -632,11 +659,23 @@ void test_interrupted_commit(Files& files, bool encrypted, bool after) {
         if (entry.path().filename().string().find(".tmp.") != std::string::npos) fs::remove(entry.path());
     }
 }
-#endif
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 5 && std::string(argv[1]) == "--crash-child") {
+        try {
+            Handle handle;
+            const bool encrypted = std::string(argv[3]) == "1";
+            handle.open(fs::u8path(idydb_test::unhex(argv[2])), encrypted);
+            Crash crash = {std::string(argv[4]) == "1" ? IDYDB_TEST_AFTER_REPLACE : IDYDB_TEST_BEFORE_REPLACE};
+            idydb_test_set_hook(Crash::callback, &crash);
+            const int status = idydb_rag_upsert_text(&handle.value, 1, 2, 1, new_text, new_vector, 2);
+            if (encrypted && status == IDYDB_DONE) idydb_flush(&handle.value);
+            idydb_test::crash_exit(92);
+        } catch (...) { idydb_test::crash_exit(93); }
+    }
+    test_executable = idydb_test::executable(argv[0]);
     Files files;
     try {
         test_mutation_failures(files, false);
@@ -646,23 +685,20 @@ int main() {
         test_borrowed_rag_inputs(files, false);
         test_borrowed_rag_inputs(files, true);
         test_plain_commit_failures(files);
+        test_plain_failure_authoritative_path(files);
         test_failed_delete(files);
         test_plain_open_lock_acquisition(files);
         test_encrypted_persistence_failures(files);
         test_plain_failed_close_cleanup(files);
         test_encrypted_retry(files);
-#if !defined(_WIN32)
         test_post_replacement_failure(files, false);
         test_post_replacement_failure(files, true);
         test_plain_directory_sync_retry(files);
-#endif
         test_flush_and_discard(files);
-#if !defined(_WIN32)
         for (bool encrypted : {false, true}) {
             test_interrupted_commit(files, encrypted, false);
             test_interrupted_commit(files, encrypted, true);
         }
-#endif
         files.require_no_staging();
         fs::remove_all(files.directory);
         std::cout << "Atomic mutation, persistence failure, discard, and interruption tests passed\n";

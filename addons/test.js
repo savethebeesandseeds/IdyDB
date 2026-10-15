@@ -143,6 +143,22 @@ async function run() {
   assert.equal(db.columnNextRow(1), 3, 'a discarded wrapper can reopen');
   db.close();
 
+  const unicodeFilename = path.join(directory, 'بيانات café 🐝 with spaces.db');
+  const unicodeText = 'Stored العربية café 🐝 text';
+  const unicode = handle();
+  unicode.open(unicodeFilename, IDYDB_CREATE);
+  unicode.ragUpsertText(1, 2, 1, unicodeText, query);
+  unicode.insertInt(3, 1, 73);
+  unicode.insertBool(4, 1, true);
+  unicode.insertConstChar(5, 1, 'unicode');
+  unicode.close();
+  assert.equal(fs.existsSync(unicodeFilename), true, 'UTF-8 pathname must identify the persisted database');
+  unicode.open(unicodeFilename, IDYDB_READONLY);
+  assert.equal(unicode.ragQueryContext(1, 2, query, 1, IDYDB_SIM_COSINE, 0), unicodeText);
+  const unicodeHits = unicode.ragQueryHitsIncludedOnly(1, 2, 4, 5, query, 1, IDYDB_SIM_COSINE, [3], 'unicode');
+  assert.equal(unicodeHits[0].meta['3'], 73, 'Unicode-path reopen must retain metadata');
+  unicode.close();
+
   // GC must release the native lock even if a caller forgets explicit close.
   assert.equal(typeof global.gc, 'function', 'run tests using node --expose-gc');
   const orphanPath = path.join(directory, 'orphan.db');

@@ -1,4 +1,5 @@
 #include "db.h"
+#include "failure_hooks.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -14,13 +15,27 @@ static std::string bytes(const fs::path& path) {
     std::ifstream stream(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
+static std::string locked_bytes(idydb** handle, const fs::path& path) {
+#if defined(_WIN32)
+    (void)path;
+    unsigned char* data = nullptr;
+    size_t size = 0;
+    CHECK(idydb_test_backing_snapshot(handle, &data, &size) == IDYDB_DONE);
+    std::string result(reinterpret_cast<char*>(data), size);
+    idydb_free(data);
+    return result;
+#else
+    (void)handle;
+    return bytes(path);
+#endif
+}
 static int encrypted(const fs::path& path, idydb** handle, int flags, const char* password) {
     idydb_open_options options = {};
     options.flags = flags;
     options.encrypted_at_rest = true;
     options.passphrase = password;
     options.pbkdf2_iter = 10000;
-    return idydb_open_with_options(path.string().c_str(), handle, &options);
+    return idydb_open_with_options(path.u8string().c_str(), handle, &options);
 }
 int main() {
     const fs::path root = fs::temp_directory_path() / ("idydb-persistence-" +
@@ -32,7 +47,7 @@ int main() {
         CHECK(encrypted(path, &handle, IDYDB_CREATE, "secret") == IDYDB_SUCCESS);
         CHECK(idydb_insert_const_char(&handle, 1, 1, "private payload") == IDYDB_DONE);
         idydb* original = handle;
-        CHECK(idydb_open(path.string().c_str(), &handle, IDYDB_CREATE) == IDYDB_ERROR);
+        CHECK(idydb_open(path.u8string().c_str(), &handle, IDYDB_CREATE) == IDYDB_ERROR);
         CHECK(handle == original);
         idydb* competing = nullptr;
         CHECK(encrypted(path, &competing, IDYDB_CREATE, "secret") == IDYDB_BUSY);
@@ -60,7 +75,7 @@ int main() {
         fs::create_directory(path);
         CHECK(idydb_close(&handle) == IDYDB_ERROR);
         CHECK(handle != nullptr);
-        CHECK(bytes(backup) == saved);
+        CHECK(locked_bytes(&handle, backup) == saved);
         CHECK(idydb_extract(&handle, 1, 1) == IDYDB_DONE);
         CHECK(std::string(idydb_retrieve_char(&handle)) == "changed payload");
         fs::remove(path);
@@ -78,7 +93,7 @@ int main() {
         CHECK(bytes(path) == saved);
 
         auto plain = root / "migration.db";
-        CHECK(idydb_open(plain.string().c_str(), &handle, IDYDB_CREATE) == IDYDB_SUCCESS);
+        CHECK(idydb_open(plain.u8string().c_str(), &handle, IDYDB_CREATE) == IDYDB_SUCCESS);
         CHECK(idydb_insert_int(&handle, 1, 1, 42) == IDYDB_DONE);
         CHECK(idydb_close(&handle) == IDYDB_DONE);
         std::string plain_saved = bytes(plain);

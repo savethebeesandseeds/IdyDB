@@ -107,7 +107,7 @@ void upsert(Handle& handle, const char* text, const float* vector) {
 
 void create_fixture(const fs::path& path, const char* text = old_text) {
     Handle handle;
-    check(idydb_open(path.string().c_str(), &handle.value, IDYDB_CREATE) == IDYDB_SUCCESS,
+    check(idydb_open(path.u8string().c_str(), &handle.value, IDYDB_CREATE) == IDYDB_SUCCESS,
           "fixture database creation failed");
     upsert(handle, text, old_vector);
     handle.close();

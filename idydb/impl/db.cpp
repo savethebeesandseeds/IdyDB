@@ -17,89 +17,22 @@
 #include <math.h>
 #include <stdint.h>
 #include <limits.h>
+#include <limits>
 
-#if defined(_WIN32)
-#ifndef _CRT_SECURE_NO_WARNINGS
-#define _CRT_SECURE_NO_WARNINGS
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <io.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+static_assert(CHAR_BIT == 8 && sizeof(short) == 2 && sizeof(int) == 4 && sizeof(float) == 4,
+              "IdyDB requires 8-bit bytes, 16-bit shorts, and 32-bit ints/floats");
+static_assert(std::numeric_limits<float>::is_iec559, "IdyDB requires IEEE-754 floats");
 
-#ifndef F_OK
-#define F_OK 0
-#endif
-
-/* POSIX-ish names used by the codebase */
-#define access     _access
-#define fileno     _fileno
-#define fdopen     _fdopen
-#define fsync      _commit
-#define ftruncate  _chsize_s
-
-/* 64-bit file offsets (needed for BIG mode on Windows) */
-#define fseek _fseeki64
-#define ftell _ftelli64
-
-/* flock(2) compatibility (good enough for advisory lock usage in this project) */
-#ifndef LOCK_SH
-#define LOCK_SH 1
-#define LOCK_EX 2
-#define LOCK_NB 4
-#define LOCK_UN 8
-#endif
-
-static int flock(int fd, int operation)
-{
-	HANDLE h = (HANDLE)_get_osfhandle(fd);
-	if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
-
-	OVERLAPPED ov;
-	memset(&ov, 0, sizeof(ov));
-
-	if (operation & LOCK_UN)
-	{
-		if (!UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov))
-		{
-			DWORD e = GetLastError();
-			/* behave closer to POSIX: unlocking an unlocked file is not fatal here */
-			if (e != ERROR_NOT_LOCKED) { errno = EINVAL; return -1; }
-		}
-		return 0;
-	}
-
-	DWORD flags = 0;
-	if (operation & LOCK_EX) flags |= LOCKFILE_EXCLUSIVE_LOCK;
-	if (operation & LOCK_NB) flags |= LOCKFILE_FAIL_IMMEDIATELY;
-
-	if (!LockFileEx(h, flags, 0, MAXDWORD, MAXDWORD, &ov))
-	{
-		DWORD e = GetLastError();
-		if (e == ERROR_LOCK_VIOLATION) errno = EWOULDBLOCK;
-		else errno = EINVAL;
-		return -1;
-	}
-	return 0;
-}
-
-#else /* POSIX */
-
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-
-#ifdef __linux__
-#include <sys/syscall.h>
-#endif
-
-#endif /* _WIN32 */
+#include "platform.h"
+#define fileno idydb_platform::descriptor
+#define fseek idydb_platform::seek
+#define ftell idydb_platform::tell
+#define fsync idydb_platform::sync
+#define flock idydb_platform::lock
+#define LOCK_SH idydb_platform::shared
+#define LOCK_EX idydb_platform::exclusive
+#define LOCK_NB idydb_platform::nonblocking
+#define LOCK_UN idydb_platform::unlock
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -123,6 +56,7 @@ static int idydb_fault(int point)
 	if (failure) errno = failure;
 	return failure;
 }
+int idydb_platform::fault(int point) { return idydb_fault(point); }
 static int idydb_fault_seek(FILE* stream, long long offset, int whence)
 {
 	if (idydb_fault(IDYDB_TEST_SEEK)) return -1;
@@ -143,23 +77,10 @@ static int idydb_fault_flush(FILE* stream)
 	if (idydb_fault(IDYDB_TEST_FLUSH)) return EOF;
 	return fflush(stream);
 }
-static int idydb_fault_sync(int fd)
-{
-	if (idydb_fault(IDYDB_TEST_FILE_SYNC)) return -1;
-	return fsync(fd);
-}
-static int idydb_fault_lock(int fd, int operation)
-{
-	if (!(operation & LOCK_UN) && idydb_fault(IDYDB_TEST_LOCK)) return -1;
-	return flock(fd, operation);
-}
 #undef fseek
-#undef fsync
 #define fseek idydb_fault_seek
 #define fwrite idydb_fault_write
 #define fflush idydb_fault_flush
-#define fsync idydb_fault_sync
-#define flock idydb_fault_lock
 #define IDYDB_FAULT(point) idydb_fault(point)
 #else
 #define IDYDB_FAULT(point) 0
@@ -311,103 +232,10 @@ static int idydb_crypto_derive_key_pbkdf2(const char* passphrase,
 	return ok == 1;
 }
 
-/* ---------------- Secure plaintext working storage ----------------
- * Goal: do NOT write plaintext to a filesystem-backed temp file.
- *
- * Linux: memfd_create (anonymous RAM-backed FD).
- * Fallback: shm_open + shm_unlink (usually tmpfs-backed; anonymous after unlink).
- */
-#ifdef __linux__
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC 0x0001U
-#endif
-static int idydb_memfd_create_compat(const char* name, unsigned int flags)
-{
-#ifdef SYS_memfd_create
-	return (int)syscall(SYS_memfd_create, name, flags);
-#else
-	errno = ENOSYS;
-	return -1;
-#endif
-}
-#endif
-
+/* Working-storage policy belongs to the selected OS backend. */
 static FILE* idydb_secure_plain_stream(const char** out_kind)
 {
-    if (out_kind) *out_kind = "unknown";
-
-#if defined(_WIN32)
-    {
-        /* Best-effort secure temp file on Windows */
-        wchar_t tmpPath[MAX_PATH];
-        DWORD n = GetTempPathW(MAX_PATH, tmpPath);
-        if (n == 0 || n > MAX_PATH) return NULL;
-
-        wchar_t tmpFile[MAX_PATH];
-        if (GetTempFileNameW(tmpPath, L"idy", 0, tmpFile) == 0) return NULL;
-
-        HANDLE h = CreateFileW(tmpFile,
-                               GENERIC_READ | GENERIC_WRITE,
-                               0, /* no sharing */
-                               NULL,
-                               CREATE_ALWAYS,
-                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
-                               NULL);
-        if (h == INVALID_HANDLE_VALUE) {
-            DeleteFileW(tmpFile);
-            return NULL;
-        }
-
-        int fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
-        if (fd < 0) {
-            CloseHandle(h);
-            return NULL;
-        }
-
-        FILE* f = _fdopen(fd, "w+b");
-        if (!f) {
-            _close(fd); /* closes underlying handle too */
-            return NULL;
-        }
-
-        if (out_kind) *out_kind = "win32-temp-delete-on-close";
-        return f;
-    }
-#else
-  #ifdef __linux__
-    {
-        int fd = idydb_memfd_create_compat("idydb_plain", MFD_CLOEXEC);
-        if (fd >= 0) {
-            (void)fchmod(fd, 0600);
-            FILE* f = fdopen(fd, "w+b");
-            if (!f) { close(fd); return NULL; }
-            if (out_kind) *out_kind = "memfd";
-            return f;
-        }
-    }
-  #endif
-
-    /* POSIX fallback: shm_open + shm_unlink */
-    {
-        unsigned char rnd[16];
-        if (RAND_bytes(rnd, sizeof(rnd)) != 1) return NULL;
-
-        char name[64];
-        snprintf(name, sizeof(name),
-                 "/idydb_%02x%02x%02x%02x%02x%02x%02x%02x",
-                 rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7]);
-
-        int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-        if (fd < 0) return NULL;
-
-		if (shm_unlink(name) != 0) { close(fd); return NULL; }
-
-        FILE* f = fdopen(fd, "w+b");
-        if (!f) { close(fd); return NULL; }
-        if (out_kind) *out_kind = "shm";
-        return f;
-    }
-#endif
+    return idydb_platform::secure_plain_stream(out_kind);
 }
 
 static int idydb_crypto_decrypt_locked_file_to_stream(FILE* in,
@@ -533,7 +361,7 @@ static int idydb_crypto_encrypt_stream_to_locked_file(FILE* plain,
 
 	/* truncate & write placeholder header */
 	if (fflush(out) != 0) return 0;
-	if (ftruncate(fileno(out), 0) != 0) return 0;
+	if (idydb_platform::resize(out, 0) != 0) return 0;
 
 	if (fseek(out, 0L, SEEK_SET) != 0) return 0;
 	if (fwrite(hdr, 1, IDYDB_ENC_HDR_LEN, out) != IDYDB_ENC_HDR_LEN) return 0;
@@ -614,9 +442,7 @@ typedef struct idydb
 	bool unsafe;
 #endif
 #ifdef IDYDB_MMAP_OK
-#if defined(_WIN32)
-	HANDLE win32_mmap_handle; /* CreateFileMapping handle if using MapViewOfFile */
-#endif
+	void* mapping_cookie; /* private backend-owned mapping handle */
 #endif
 
 	idydb_embed_fn embedder;
@@ -641,107 +467,53 @@ typedef struct idydb
 
 } idydb;
 
+#ifdef IDYDB_TESTING
+/* Inspect the physical image through its owning handle: Win32 exclusive locks
+ * prohibit opening a second handle even in the process that owns the lock. */
+extern "C" int idydb_test_backing_snapshot(idydb** handler, unsigned char** bytes, size_t* length)
+{
+    if (!bytes || !length) return IDYDB_ERROR;
+    *bytes = NULL;
+    *length = 0;
+    if (!handler || !*handler || !(*handler)->configured) return IDYDB_ERROR;
+    FILE* stream = (*handler)->encryption_enabled ? (*handler)->backing_descriptor : (*handler)->file_descriptor;
+    if (!stream) return IDYDB_ERROR;
+    const int64_t position = idydb_platform::tell(stream);
+    if (position < 0 || idydb_platform::seek(stream, 0, SEEK_END) != 0) return IDYDB_ERROR;
+    const int64_t size = idydb_platform::tell(stream);
+    if (size < 0 || (uint64_t)size > SIZE_MAX || idydb_platform::seek(stream, 0, SEEK_SET) != 0) {
+        (void)idydb_platform::seek(stream, position, SEEK_SET);
+        return IDYDB_ERROR;
+    }
+    unsigned char* copy = (unsigned char*)malloc(size ? (size_t)size : 1);
+    const bool copied = copy && fread(copy, 1, (size_t)size, stream) == (size_t)size;
+    const bool restored = idydb_platform::seek(stream, position, SEEK_SET) == 0;
+    if (!copied || !restored) { free(copy); return IDYDB_ERROR; }
+    *bytes = copy;
+    *length = (size_t)size;
+    return IDYDB_DONE;
+}
+#endif
+
 /* All backing-file commits use a locked sibling file and atomic replacement. */
 static FILE* idydb_stage_file(idydb* h, char** out_path)
 {
-    *out_path = NULL;
-    if (!h->backing_filename) return NULL;
-    size_t length = strlen(h->backing_filename);
-    char* path = (char*)malloc(length + 40);
-    if (!path) return NULL;
-    FILE* stream = NULL;
-    bool created = false;
-#if defined(_WIN32)
-    unsigned char nonce[8];
-    if (RAND_bytes(nonce, sizeof(nonce)) != 1) { free(path); return NULL; }
-    snprintf(path, length + 40, "%s.tmp.%02x%02x%02x%02x%02x%02x%02x%02x",
-        h->backing_filename, nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
-    HANDLE win = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_NEW,
-        FILE_ATTRIBUTE_NORMAL, NULL);
-    if (win != INVALID_HANDLE_VALUE) {
-        created = true;
-        int fd = _open_osfhandle((intptr_t)win, _O_RDWR | _O_BINARY);
-        if (fd >= 0) { stream = fdopen(fd, "w+b"); if (!stream) _close(fd); }
-        else CloseHandle(win);
-    }
-#else
-    int fd = -1;
-    if (h->directory_fd >= 0) {
-        for (unsigned attempt = 0; attempt < 8; ++attempt) {
-            unsigned char nonce[8];
-            if (RAND_bytes(nonce, sizeof(nonce)) != 1) break;
-            snprintf(path, length + 40, ".idydb.tmp.%02x%02x%02x%02x%02x%02x%02x%02x",
-                nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
-            fd = openat(h->directory_fd, path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-            if (fd >= 0 || errno != EEXIST) break;
-        }
-    } else {
-        snprintf(path, length + 40, "%s.tmp.XXXXXX", h->backing_filename);
-        fd = mkstemp(path);
-    }
-    if (fd >= 0) {
-        created = true;
-        struct stat original;
-        FILE* backing = h->encryption_enabled ? h->backing_descriptor : h->file_descriptor;
-        if (fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && backing && fstat(fileno(backing), &original) == 0 &&
-            fchown(fd, original.st_uid, original.st_gid) == 0 &&
-            fchmod(fd, original.st_mode & 0777) == 0) stream = fdopen(fd, "w+b");
-        if (!stream) close(fd);
-    }
-#endif
-    if (stream && flock(fileno(stream), LOCK_EX | LOCK_NB) == 0) {
-        *out_path = path;
-        return stream;
-    }
-    if (stream) fclose(stream);
-    if (created) {
-#if defined(_WIN32)
-        DeleteFileA(path);
-#else
-        if (h->directory_fd >= 0) unlinkat(h->directory_fd, path, 0);
-        else unlink(path);
-#endif
-    }
-    free(path);
-    return NULL;
+    FILE* backing = h->encryption_enabled ? h->backing_descriptor : h->file_descriptor;
+    return idydb_platform::stage(backing, h->backing_filename, h->directory_fd, out_path);
 }
 
 static void idydb_stage_cleanup(FILE* stream, char* path, int directory_fd)
 {
     if (stream) fclose(stream);
     if (path) {
-#if defined(_WIN32)
-        (void)directory_fd;
-        DeleteFileA(path);
-#else
-        if (directory_fd >= 0) unlinkat(directory_fd, path, 0);
-        else unlink(path);
-#endif
+        idydb_platform::remove_stage(path, directory_fd);
         free(path);
     }
 }
 
 static int idydb_sync_directory(const char* filename, int directory_fd)
 {
-#if defined(_WIN32)
-    (void)filename;
-    (void)directory_fd;
-    return IDYDB_FAULT(IDYDB_TEST_DIRECTORY_SYNC) == 0;
-#else
-    if (directory_fd >= 0) return IDYDB_FAULT(IDYDB_TEST_DIRECTORY_SYNC) == 0 && fsync(directory_fd) == 0;
-    char* parent = (char*)malloc(strlen(filename) + 1);
-    if (!parent) return 0;
-    strcpy(parent, filename);
-    char* slash = strrchr(parent, '/');
-    if (slash) { if (slash == parent) slash[1] = '\0'; else *slash = '\0'; }
-    int fd = open(slash ? parent : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    free(parent);
-    if (fd < 0) return 0;
-    int ok = IDYDB_FAULT(IDYDB_TEST_DIRECTORY_SYNC) == 0 && fsync(fd) == 0;
-    close(fd);
-    return ok;
-#endif
+    return idydb_platform::sync_directory(filename, directory_fd);
 }
 
 /* Once renamed, adopt the new locked inode even when directory sync fails.
@@ -749,22 +521,8 @@ static int idydb_sync_directory(const char* filename, int directory_fd)
 static int idydb_publish(idydb* h, FILE** staged, const char* path, idydb_sizing_max size)
 {
     if (IDYDB_FAULT(IDYDB_TEST_BEFORE_REPLACE) || IDYDB_FAULT(IDYDB_TEST_REPLACE)) return 0;
-#if defined(_WIN32)
-    if (!MoveFileExA(path, h->backing_filename, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
-#else
-    if (h->directory_fd >= 0) {
-        struct stat opened, current;
-        FILE* backing = h->encryption_enabled ? h->backing_descriptor : h->file_descriptor;
-        if (fstat(fileno(backing), &opened) != 0 ||
-            fstatat(h->directory_fd, h->backing_filename, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
-            !S_ISREG(current.st_mode) || opened.st_dev != current.st_dev || opened.st_ino != current.st_ino) {
-            errno = ESTALE;
-            return 0;
-        }
-        if (renameat(h->directory_fd, path, h->directory_fd, h->backing_filename) != 0) return 0;
-    } else if (rename(path, h->backing_filename) != 0) return 0;
-#endif
     FILE** destination = h->encryption_enabled ? &h->backing_descriptor : &h->file_descriptor;
+    if (!idydb_platform::replace(*destination, *staged, path, h->backing_filename, h->directory_fd)) return 0;
     FILE* previous = *destination;
     *destination = *staged;
     *staged = NULL;
@@ -1097,9 +855,7 @@ static int idydb_new(idydb **handler)
 	(*handler)->plain_storage_kind = NULL;
 
 #ifdef IDYDB_MMAP_OK
-#if defined(_WIN32)
-	(*handler)->win32_mmap_handle = NULL;
-#endif
+	(*handler)->mapping_cookie = NULL;
 #endif
 
 	if (IDYDB_MAX_BUFFER_SIZE < 50)
@@ -1140,12 +896,10 @@ static void idydb_destroy(idydb **handler)
 		free((*handler)->backing_filename);
 		(*handler)->backing_filename = NULL;
 	}
-#if !defined(_WIN32)
 	if ((*handler)->directory_fd >= 0) {
-		close((*handler)->directory_fd);
+		idydb_platform::close_directory((*handler)->directory_fd);
 		(*handler)->directory_fd = -1;
 	}
-#endif
 	{
 		OPENSSL_cleanse((*handler)->enc_key, sizeof((*handler)->enc_key));
 		(*handler)->enc_key_set = false;
@@ -1157,20 +911,9 @@ static void idydb_destroy(idydb **handler)
 #ifdef IDYDB_MMAP_OK
 	if ((*handler)->read_only == IDYDB_READONLY_MMAPPED)
 	{
-#if defined(_WIN32)
-		if ((*handler)->buffer) {
-			UnmapViewOfFile((*handler)->buffer);
-			(*handler)->buffer = NULL;
-		}
-		if ((*handler)->win32_mmap_handle) {
-			CloseHandle((*handler)->win32_mmap_handle);
-			(*handler)->win32_mmap_handle = NULL;
-		}
-#else
-		if ((*handler)->buffer != NULL && (*handler)->buffer != MAP_FAILED)
-			munmap((*handler)->buffer, (size_t)(*handler)->size);
+		idydb_platform::unmap((*handler)->buffer, (*handler)->size, (*handler)->mapping_cookie);
 		(*handler)->buffer = NULL;
-#endif
+		(*handler)->mapping_cookie = NULL;
 	}
 	else
 #endif
@@ -1260,67 +1003,7 @@ static int idydb_connection_setup_stream(idydb **handler, FILE* stream, int flag
  * so a caller never writes an old inode after another handle replaces the file. */
 static FILE* idydb_open_locked(const char* filename, int flags, int* status, int directory_fd = -1)
 {
-    const bool ro = ((flags & IDYDB_READONLY) == IDYDB_READONLY);
-    const bool create = !ro && ((flags & IDYDB_CREATE) == IDYDB_CREATE);
-    *status = IDYDB_ERROR;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-#if defined(_WIN32)
-        (void)directory_fd;
-        HANDLE win = CreateFileA(filename, ro ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE),
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-            create ? OPEN_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (win == INVALID_HANDLE_VALUE) {
-            *status = GetLastError() == ERROR_FILE_NOT_FOUND ? IDYDB_NOT_FOUND : IDYDB_PERM;
-            return NULL;
-        }
-        int fd = _open_osfhandle((intptr_t)win, (ro ? _O_RDONLY : _O_RDWR) | _O_BINARY);
-        if (fd < 0) { CloseHandle(win); return NULL; }
-#else
-        int mode = (ro ? O_RDONLY : O_RDWR) | (create ? O_CREAT : 0) | O_CLOEXEC;
-        int fd = directory_fd >= 0 ? openat(directory_fd, filename, mode | O_NOFOLLOW | O_NONBLOCK, 0600) :
-            open(filename, mode, 0600);
-        if (fd < 0) { *status = errno == ENOENT ? IDYDB_NOT_FOUND : IDYDB_PERM; return NULL; }
-        struct stat metadata;
-        if (directory_fd >= 0 && (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode))) {
-            close(fd); *status = IDYDB_CORRUPT; return NULL;
-        }
-#endif
-        FILE* stream = fdopen(fd, ro ? "rb" : "r+b");
-        if (!stream) {
-#if defined(_WIN32)
-            _close(fd);
-#else
-            close(fd);
-#endif
-            return NULL;
-        }
-        if (flock(fd, LOCK_NB | (ro ? LOCK_SH : LOCK_EX)) != 0) {
-            fclose(stream); *status = IDYDB_BUSY; return NULL;
-        }
-        bool same = false;
-#if defined(_WIN32)
-        BY_HANDLE_FILE_INFORMATION opened, current;
-        HANDLE path = CreateFileA(filename, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (path != INVALID_HANDLE_VALUE) {
-            same = GetFileInformationByHandle(win, &opened) && GetFileInformationByHandle(path, &current)
-                && opened.dwVolumeSerialNumber == current.dwVolumeSerialNumber
-                && opened.nFileIndexHigh == current.nFileIndexHigh
-                && opened.nFileIndexLow == current.nFileIndexLow;
-            CloseHandle(path);
-        }
-#else
-        struct stat opened, current;
-        int path_status = directory_fd >= 0 ? fstatat(directory_fd, filename, &current, AT_SYMLINK_NOFOLLOW) :
-            stat(filename, &current);
-        same = fstat(fd, &opened) == 0 && path_status == 0
-            && opened.st_dev == current.st_dev && opened.st_ino == current.st_ino;
-#endif
-        if (same) { *status = IDYDB_SUCCESS; return stream; }
-        fclose(stream);
-    }
-    *status = IDYDB_BUSY;
-    return NULL;
+    return idydb_platform::open_locked(filename, flags, status, directory_fd);
 }
 
 static int idydb_connection_setup(idydb **handler, const char *filename, int flags)
@@ -1334,32 +1017,19 @@ static int idydb_connection_setup(idydb **handler, const char *filename, int fla
     int rc = idydb_connection_setup_stream(handler, stream, flags, true);
     if (rc != IDYDB_SUCCESS) return rc;
     if ((*handler)->read_only == IDYDB_READ_AND_WRITE) {
-#if defined(_WIN32)
-    (*handler)->backing_filename = _fullpath(NULL, filename, 0);
-#else
-    (*handler)->backing_filename = realpath(filename, NULL);
-#endif
+    (*handler)->backing_filename = idydb_platform::canonical_path(stream, filename);
     if (!(*handler)->backing_filename) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
     }
 #ifdef IDYDB_MMAP_OK
     if ((*handler)->read_only == IDYDB_READONLY && (*handler)->size > 0
         && (*handler)->size <= IDYDB_MMAP_MAX_SIZE) {
-#if defined(_WIN32)
-        HANDLE win = (HANDLE)_get_osfhandle(fileno(stream));
-        HANDLE mapping = CreateFileMappingW(win, NULL, PAGE_READONLY, 0, 0, NULL);
-        void* view = mapping ? MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) : NULL;
+        void* cookie = NULL;
+        void* view = idydb_platform::map_readonly(stream, (*handler)->size, &cookie);
         if (view) {
             free((*handler)->buffer); (*handler)->buffer = view;
-            (*handler)->win32_mmap_handle = mapping;
-            (*handler)->read_only = IDYDB_READONLY_MMAPPED;
-        } else if (mapping) CloseHandle(mapping);
-#else
-        void* view = mmap(NULL, (size_t)(*handler)->size, PROT_READ, MAP_PRIVATE, fileno(stream), 0);
-        if (view != MAP_FAILED) {
-            free((*handler)->buffer); (*handler)->buffer = view;
+            (*handler)->mapping_cookie = cookie;
             (*handler)->read_only = IDYDB_READONLY_MMAPPED;
         }
-#endif
     }
 #endif
     return IDYDB_SUCCESS;
@@ -1406,7 +1076,7 @@ static int idydb_open_internal(const char *filename, idydb **handler, const idyd
 		return IDYDB_ERROR;
 	}
 
-	bool file_exists = (access(filename, F_OK) == 0);
+	bool file_exists = idydb_platform::exists(filename);
 	if (!file_exists && ((flags & IDYDB_CREATE) == 0))
 	{
 		idydb_error_state(handler, 4);
@@ -1426,11 +1096,7 @@ static int idydb_open_internal(const char *filename, idydb **handler, const idyd
 	(*handler)->encryption_enabled = true;
 	(*handler)->backing_descriptor = backing;
 	if (!ro) {
-#if defined(_WIN32)
-	(*handler)->backing_filename = _fullpath(NULL, filename, 0);
-#else
-	(*handler)->backing_filename = realpath(filename, NULL);
-#endif
+	(*handler)->backing_filename = idydb_platform::canonical_path(backing, filename);
 	if (!(*handler)->backing_filename) { idydb_error_state(handler, 24); return IDYDB_ERROR; }
 	}
 	(*handler)->dirty = false;
@@ -1590,18 +1256,10 @@ int idydb_open_at(int directory_fd, const char* filename, idydb** handler, int f
 	    (flags & ~(IDYDB_CREATE | IDYDB_READONLY | IDYDB_UNSAFE)) != 0 ||
 	    ((flags & IDYDB_CREATE) != 0 && (flags & IDYDB_CREATE) != IDYDB_CREATE)) return IDYDB_ERROR;
 	if (*handler && (*handler)->configured) { idydb_error_state(handler, 3); return IDYDB_ERROR; }
-	struct stat metadata;
-	if (directory_fd < 0 || fstat(directory_fd, &metadata) != 0 || !S_ISDIR(metadata.st_mode)) return IDYDB_ERROR;
-	const int directory_flags = fcntl(directory_fd, F_GETFL);
-	if (directory_flags < 0 || (directory_flags & O_ACCMODE) != O_RDONLY) return IDYDB_ERROR;
-#if defined(O_PATH)
-	/* O_PATH anchors support openat but cannot synchronize a published entry. */
-	if ((directory_flags & O_PATH) != 0) return IDYDB_ERROR;
-#endif
-	int owned_directory = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
-	if (owned_directory < 0) return IDYDB_PERM;
+	int owned_directory = idydb_platform::duplicate_directory(directory_fd);
+	if (owned_directory < 0) return errno == EINVAL || errno == EBADF ? IDYDB_ERROR : IDYDB_PERM;
 	if (*handler) { idydb_destroy(handler); free(*handler); *handler = NULL; }
-	if (idydb_new(handler) != IDYDB_SUCCESS) { close(owned_directory); return IDYDB_ERROR; }
+	if (idydb_new(handler) != IDYDB_SUCCESS) { idydb_platform::close_directory(owned_directory); return IDYDB_ERROR; }
 	(*handler)->directory_fd = owned_directory;
 	(*handler)->backing_filename = (char*)malloc(strlen(filename) + 1);
 	if (!(*handler)->backing_filename) {
@@ -2855,7 +2513,7 @@ static unsigned char idydb_insert_at_inplace(idydb **handler, idydb_column_row_s
 			else (*handler)->size -= IDYDB_PARTITION_AND_SEGMENT;
 		}
 		if (fflush((*handler)->file_descriptor) != 0 ||
-		    ftruncate(fileno((*handler)->file_descriptor), (*handler)->size) != 0)
+		    idydb_platform::resize((*handler)->file_descriptor, (*handler)->size) != 0)
 		{
 			idydb_clear_values(handler);
 			idydb_error_state(handler, 17);
@@ -3180,6 +2838,8 @@ static void idydb_query_results_reset(idydb_knn_result* results, unsigned short 
 }
 
 /* ---------------- Filter helpers ---------------- */
+
+void* idydb_alloc(size_t bytes) { return malloc(bytes); }
 
 void idydb_free(void* p) { if (p) free(p); }
 

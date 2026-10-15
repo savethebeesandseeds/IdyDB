@@ -1,0 +1,13 @@
+# Cross compilation runs only in idydb-dev; Windows receives runtime files only.
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR AMD64)
+set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc-posix)
+set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++-posix)
+set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
+set(CMAKE_FIND_ROOT_PATH /usr/x86_64-w64-mingw32 /build/windows-deps)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+set(OPENSSL_ROOT_DIR /build/windows-deps CACHE PATH "Cross-compiled Windows OpenSSL")
+set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "Statically link Windows OpenSSL Crypto")

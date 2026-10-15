@@ -1,5 +1,6 @@
 #ifndef IDYDB_TEST_FAILURE_HOOKS_H
 #define IDYDB_TEST_FAILURE_HOOKS_H
+#include <stddef.h>
 
 /* Private to the separately compiled instrumented test library. */
 enum {
@@ -23,6 +24,8 @@ typedef int (*idydb_test_hook)(int stage, void* user);
 extern "C" {
 #endif
 void idydb_test_set_hook(idydb_test_hook hook, void* user);
+struct idydb;
+int idydb_test_backing_snapshot(struct idydb** handler, unsigned char** bytes, size_t* length);
 #ifdef __cplusplus
 }
 #endif

@@ -27,8 +27,12 @@
         ["idydb_testing==1", {
           "defines": [ "IDYDB_TESTING=1" ]
         }],
+        ["OS!=\"win\"", {
+          "sources": [ "../idydb/impl/platform_posix.cpp" ],
+          "defines": [ "_FILE_OFFSET_BITS=64" ]
+        }],
         ["OS==\"linux\"", {
-          "libraries": [ "-lssl", "-lcrypto" ]
+          "libraries": [ "-lcrypto" ]
         }],
 
         ["OS==\"mac\"", {
@@ -37,7 +41,7 @@
             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
             "MACOSX_DEPLOYMENT_TARGET": "10.15"
           },
-          "libraries": [ "-lssl", "-lcrypto" ],
+          "libraries": [ "-lcrypto" ],
           "include_dirs": [
             "<!@(node -p \"require('node-addon-api').include\")",
             "../idydb/include",
@@ -49,17 +53,19 @@
         }],
 
         ["OS==\"win\"", {
+          "sources": [ "../idydb/impl/platform_windows.cpp" ],
           "defines": [
             "NOMINMAX",
-            "WIN32_LEAN_AND_MEAN",
-            "IDYDB_DISABLE_SHM=1"
+            "WIN32_LEAN_AND_MEAN"
           ],
           "msvs_settings": {
             "VCCLCompilerTool": {
               "LanguageStandard": "stdcpp17",
               "ExceptionHandling": 1,
+              "RuntimeLibrary": 2,
               "AdditionalOptions": [
-                "/std:c++17"
+                "/std:c++17",
+                "/utf-8"
               ]
             }
           },
@@ -72,8 +78,11 @@
             "<!(node -p \"process.env.OPENSSL_LIB_DIR || ''\")"
           ],
           "libraries": [
-            "libssl.lib",
-            "libcrypto.lib"
+            "libcrypto.lib",
+            "crypt32.lib",
+            "ws2_32.lib",
+            "advapi32.lib",
+            "gdi32.lib"
           ]
         }]
       ]

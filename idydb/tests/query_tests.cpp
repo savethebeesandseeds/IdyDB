@@ -8,6 +8,11 @@
 #include <limits>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#endif
 
 #define CHECK(condition) do { if (!(condition)) { \
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition); \
@@ -20,7 +25,16 @@ struct TemporaryFile {
         static unsigned serial = 0;
         path = "idydb-query-test-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(serial++) + ".db";
+#if defined(_WIN32)
+        // The legacy Windows CRT lacks C11's fopen "x" mode. Reserve the
+        // name atomically before adopting its binary descriptor as a stream.
+        const int descriptor = _open(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL |
+            _O_BINARY | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
+        FILE* file = descriptor < 0 ? nullptr : _fdopen(descriptor, "wb");
+        if (!file && descriptor >= 0) _close(descriptor);
+#else
         FILE* file = std::fopen(path.c_str(), "wbx");
+#endif
         CHECK(file);
         CHECK(std::fclose(file) == 0);
     }

@@ -108,6 +108,9 @@ typedef struct idydb_open_options {
  * Returns IDYDB_SUCCESS on success; otherwise an IDYDB_* error status.
  * A failed open may leave a handler for error reporting: read idydb_errmsg,
  * then call idydb_discard. filename/options/passphrase are borrowed for this call.
+ * On Windows, filename is UTF-8; malformed UTF-8, final-component reparse points,
+ * and named alternate data streams are rejected. The POSIX backend uses native
+ * filesystem bytes. Portable filenames should be valid UTF-8.
  * flags may combine IDYDB_CREATE, IDYDB_READONLY and IDYDB_UNSAFE; 0 opens an
  * existing file writable. Encryption is persisted on explicit flush or close.
  */
@@ -285,6 +288,9 @@ typedef struct {
 } idydb_value;
 
 /* Convenience free helpers for heap allocations returned by IdyDB APIs. */
+/* Allocate callback output in the library's heap, including across Windows DLL
+ * boundaries. Release with idydb_free unless ownership is transferred to IdyDB. */
+idydb_extern void* idydb_alloc(size_t bytes);
 idydb_extern void idydb_free(void* p);
 idydb_extern void idydb_value_free(idydb_value* v);
 idydb_extern void idydb_values_free(idydb_value* values, size_t count);
@@ -330,7 +336,7 @@ idydb_extern int idydb_rag_upsert_text(idydb **handler,
                                        const float* embedding,
                                        unsigned short dims);
 
-/* Return 0 on success with a malloc-compatible *out_vector and valid *out_dims.
+/* Return 0 on success with *out_vector allocated by idydb_alloc and valid *out_dims.
  * IdyDB owns and frees the returned vector after the callback, including a
  * non-NULL vector returned on error. text/user are borrowed; the callback and
  * user pointer must remain valid until replaced or the handler is closed. */
@@ -476,6 +482,7 @@ using ::idydb_filter_term;
 using ::idydb_filter;
 using ::idydb_value;
 using ::idydb_free;
+using ::idydb_alloc;
 using ::idydb_value_free;
 using ::idydb_values_free;
 

@@ -1,0 +1,15 @@
+# Optional MinGW dependency additions to the base dev/packages.lock environment.
+# Debian 13 amd64; resolved with --no-install-recommends on 2026-10-15.
+binutils-mingw-w64-x86-64=2.44-3+12+b1
+curl=8.14.1-2+deb13u7
+g++-mingw-w64-x86-64-posix=14.2.0-19+27+b1
+gcc-mingw-w64-base=14.2.0-19+27+b1
+gcc-mingw-w64-x86-64-posix=14.2.0-19+27+b1
+gcc-mingw-w64-x86-64-posix-runtime=14.2.0-19+27+b1
+libgdbm-compat4t64=1.24-2
+libgdbm6t64=1.24-2
+libperl5.40=5.40.1-6+deb13u1
+mingw-w64-common=12.0.0-5
+mingw-w64-x86-64-dev=12.0.0-5
+perl=5.40.1-6+deb13u1
+perl-modules-5.40=5.40.1-6+deb13u1

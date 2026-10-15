@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+if(NOT @IDYDB_BUILD_SHARED@)
+    find_dependency(OpenSSL COMPONENTS Crypto)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/idydbTargets.cmake")
+check_required_components(idydb)

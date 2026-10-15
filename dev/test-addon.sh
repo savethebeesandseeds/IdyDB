@@ -2,11 +2,15 @@
 # Run inside idydb-dev. All npm dependencies and build outputs stay in /build.
 set -eu
 workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-mkdir -p /build/node-source/addons /build/node-source/idydb/tests
+mkdir -p /build/node-source/addons /build/node-source/idydb/tests \
+    /build/node-source/idydb/include /build/node-source/idydb/impl
 cp "$workspace/addons/addon.cpp" "$workspace/addons/binding.gyp" "$workspace/addons/package.json" \
    "$workspace/addons/package-lock.json" "$workspace/addons/test.js" \
    "$workspace/addons/test-failure.js" /build/node-source/addons/
-cp -R "$workspace/idydb/include" "$workspace/idydb/impl" /build/node-source/idydb/
+cp "$workspace/idydb/include/db.h" /build/node-source/idydb/include/
+cp "$workspace/idydb/impl/db.cpp" "$workspace/idydb/impl/platform.h" \
+   "$workspace/idydb/impl/platform_posix.cpp" "$workspace/idydb/impl/platform_windows.cpp" \
+   /build/node-source/idydb/impl/
 cp "$workspace/idydb/tests/failure_hooks.h" /build/node-source/idydb/tests/
 cd /build/node-source/addons
 npm ci --ignore-scripts --cache /build/npm-cache

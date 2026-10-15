@@ -10,6 +10,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#endif
 
 namespace {
 #if IDYDB_SIZING_MODE == IDYDB_SIZING_MODE_TINY
@@ -36,7 +43,7 @@ struct Handle {
     idydb* value = nullptr;
     ~Handle() { idydb_close(&value); }
     void open(const std::filesystem::path& file, int flags = IDYDB_CREATE) {
-        const int rc = idydb_open(file.string().c_str(), &value, flags);
+        const int rc = idydb_open(file.u8string().c_str(), &value, flags);
         check(rc == IDYDB_SUCCESS, "open failed: " + std::string(idydb_errmsg(&value)));
     }
     void close() { check(idydb_close(&value) == IDYDB_DONE, "close failed"); }
@@ -212,7 +219,7 @@ void malformed_records(const TestFiles& files) {
         write_bytes(path, cases[index]);
         for (const int flags : {0, IDYDB_READONLY}) {
             Handle handle;
-            const int rc = idydb_open(path.string().c_str(), &handle.value, flags);
+            const int rc = idydb_open(path.u8string().c_str(), &handle.value, flags);
             check(rc == IDYDB_CORRUPT, "malformed file accepted: case " + std::to_string(index));
         }
         check(std::filesystem::file_size(path) == cases[index].size(), "malformed open modified file");
@@ -290,9 +297,22 @@ void sizing_capacity(const TestFiles& files) {
     // then the record decoder must report the invalid first record.
     const auto path = files.file("small-capacity.db");
     { std::ofstream create(path, std::ios::binary); check(create.good(), "create sparse capacity fixture"); }
+#if defined(_WIN32)
+    // NTFS does not create holes merely by extending an ordinary file. Mark
+    // this synthetic boundary fixture sparse before assigning its logical size.
+    HANDLE sparse_file = CreateFileW(path.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    check(sparse_file != INVALID_HANDLE_VALUE, "open sparse capacity fixture");
+    DWORD returned = 0;
+    const BOOL sparse = DeviceIoControl(sparse_file, FSCTL_SET_SPARSE, nullptr, 0,
+        nullptr, 0, &returned, nullptr);
+    const DWORD sparse_error = sparse ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(sparse_file);
+    check(sparse != FALSE, "mark capacity fixture sparse: " + std::to_string(sparse_error));
+#endif
     std::filesystem::resize_file(path, UINT64_C(4295099392));
     Handle handle;
-    check(idydb_open(path.string().c_str(), &handle.value, IDYDB_READONLY) == IDYDB_CORRUPT,
+    check(idydb_open(path.u8string().c_str(), &handle.value, IDYDB_READONLY) == IDYDB_CORRUPT,
           "small mode truncated file size or underestimated capacity");
 #else
     (void)files;

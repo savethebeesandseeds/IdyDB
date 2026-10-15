@@ -11,6 +11,11 @@ int main(void)
     if (idydb_version_check() != IDYDB_VERSION) return 5;
     if (idydb_flush(&handle) != IDYDB_ERROR) return 6;
     if (idydb_discard(&handle) != IDYDB_DONE) return 7;
+    {
+        void* buffer = idydb_alloc(32);
+        if (!buffer) return 8;
+        idydb_free(buffer);
+    }
     puts("C API passed");
     return 0;
 }

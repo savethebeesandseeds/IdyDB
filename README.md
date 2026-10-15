@@ -2,7 +2,11 @@
 
 IdyDB is a C++17 library with a C API for a sparse, flat-file database. It stores integers, floats, strings, booleans, and float vectors. Vector queries support cosine similarity, L2 distance, metadata filters, and retrieval of associated text.
 
-The public interface is in `idydb/include/db.h`; the implementation must also be compiled and linked with OpenSSL Crypto. This is a header-and-library project.
+The public interface is in `idydb/include/db.h`. One shared engine in
+`idydb/impl/db.cpp` uses a private storage interface in `impl/platform.h`.
+CMake selects `platform_posix.cpp` for Linux or `platform_windows.cpp` for
+Windows and links OpenSSL Crypto. Compile the engine and exactly one backend
+when integrating without CMake.
 
 ## Development
 
@@ -24,7 +28,12 @@ The base image is Debian 13 slim, pinned by digest. The repository mounts at `/w
 
 `check` runs all five library configurations (big, tiny, small, shared with mmap disabled, and address/undefined-behavior sanitizers), plus ordinary and instrumented Node tests. The GitHub workflow runs the same scripts in the pinned Debian container for pushes and pull requests. Fault hooks are compiled into separate test builds and are absent from the production library and addon.
 
-The verified runtime is Linux. The source includes Windows compatibility code; native Windows behavior still needs separate validation before a Windows release.
+Linux builds and cross-compilation run inside `idydb-dev`. Native Windows tests
+run only the exported test executables on the Windows host; compilers, SDKs,
+dependency installations and build caches remain inside the Linux container.
+The Windows target is x64 MinGW-w64 with local NTFS files and support for
+handle-based POSIX replacement (`FileRenameInfoEx`). MSVC, ARM64, x86 and
+network filesystem behavior require separate validation.
 
 Inside the configured container, the CMake workflow is:
 
@@ -43,7 +52,73 @@ CMake options:
 | `IDYDB_SIZING_MODE` | 3 | 1 = tiny, 2 = small, 3 = big |
 | `BUILD_TESTING` | ON | Build C/C++ regression suites |
 
-Consumers must use the same sizing mode as the library. Prefer linking the CMake `idydb` target so its public definitions and OpenSSL dependency propagate.
+Consumers must use the same sizing mode as the library. Prefer linking the CMake `idydb::idydb` target so its public definitions and static link dependencies propagate.
+
+### Native Windows builds through MinGW
+
+With the existing development container running, install the optional pinned
+cross-compilation dependencies and build Windows binaries inside it:
+
+```powershell
+docker exec idydb-dev sh /workspace/dev/setup-mingw.sh
+docker exec idydb-dev sh /workspace/dev/build-windows.sh
+.\dev\test-windows.ps1
+```
+
+The dependency-only setup pins Debian MinGW packages and verifies the official
+OpenSSL source archive's SHA-256 before cross-building static Crypto. Sources,
+dependencies and caches stay under `/build`. It preserves mismatched dependency
+prefixes instead of replacing them.
+
+The build covers big/tiny/small static libraries and a big shared library, with
+Debug/Release and mapping on/off. It installs each SDK and compiles separate C
+and C++ consumers against the installed package. The host test runner exports
+only test executables, runtime DLLs and synthetic fixtures into a unique ignored
+`build/windows-runtime/` directory. It runs those executables on native Windows
+and exchanges plaintext/encrypted database files with the Linux build in both
+directions. It does not install or run a compiler, SDK, npm or CMake on Windows.
+
+MinGW produces `libidydb.dll` with `libidydb.dll.a` for dynamic linking, or
+`libidydb.a` for static linking. Linux produces `libidydb.so` or `libidydb.a`.
+Both expose the same core C API and format. Import libraries are compiler
+specific; MinGW's `.dll.a` is not an MSVC `.lib` package.
+
+The Windows Node addon uses the same engine and backend. With an existing
+Node 24.19.0 x64 runtime available on the host:
+
+```powershell
+docker exec idydb-dev sh /workspace/dev/setup-windows-node.sh
+docker exec idydb-dev sh /workspace/dev/build-windows-addon.sh
+.\dev\test-windows-addon.ps1
+```
+
+Setup verifies the official Node headers and import library, then installs
+locked npm dependencies inside the Linux volume. The build produces a Node-API
+8 addon and a separate instrumented test addon. Native tests check Unicode
+filenames, ordinary operations, failed persistence and finalizer cleanup. The
+runner uses the existing host runtime and installs no host packages.
+
+### Installed CMake package
+
+Install a configured build with `cmake --install BUILD --prefix PREFIX`. A
+separate consumer can then use:
+
+```cmake
+find_package(idydb 0.1 CONFIG REQUIRED)
+target_link_libraries(my_program PRIVATE idydb::idydb)
+```
+
+Point `CMAKE_PREFIX_PATH` at the installed prefix. OpenSSL Crypto must be
+available for static consumers. The SDK includes the public header, selected
+library, exported CMake targets and license notices. The MinGW shared SDK also
+includes its three matching compiler runtime DLLs in `bin`; deploy them beside
+the application and `libidydb.dll`. Static applications still need their own
+toolchain's runtime dependencies. Linux shared libraries also require the linked
+OpenSSL Crypto runtime on the target system.
+
+C-only CMake projects can link `idydb::idydb` directly. Static GNU builds export
+the C++ runtime and math dependencies they need; enabling C++ in the consumer
+or forcing its C executable to use a C++ linker is unnecessary.
 
 ## Basic C++ usage
 
@@ -104,7 +179,7 @@ kNN and top-k RAG queries return a **count from 0 to k**, or **-1 on error**. Co
 
 Filtered queries combine terms with AND. `IS_NULL` selects missing metadata cells; comparison terms require the requested type. `idydb_column_next_row` returns the next index after the largest stored row, or 0 for an error/full column.
 
-Returned RAG strings and contexts are owned allocations: free them with `idydb_free`. Metadata strings and vectors are deep copies: release them with `idydb_values_free`. An automatic embedder callback must return a vector allocated compatibly with `free()`; IdyDB takes ownership of that allocation.
+Returned RAG strings and contexts are owned allocations: free them with `idydb_free`. Metadata strings and vectors are deep copies: release them with `idydb_values_free`. An automatic embedder callback must allocate its returned vector with `idydb_alloc`; IdyDB takes ownership of that allocation.
 
 ## Encryption
 
@@ -138,7 +213,7 @@ Debug logging is disabled by default. Define `CUWACUNU_CAMAHJUCUNU_DB_VERBOSE_DE
 
 Strings may contain up to 65,532 bytes excluding the terminating NUL; embedded NULs are unsupported. Vectors support 1–16,383 float components. The Node addon rejects out-of-range, fractional, and nonfinite arguments before narrowing numeric values.
 
-The file format is unchanged. It uses native integer/float encoding and assumes matching byte order and primitive sizes. Opens validate the complete record structure before enabling read-only mapping.
+The file format is unchanged. It uses native integer/float encoding and assumes matching byte order and primitive sizes. Builds require 8-bit bytes, 16-bit shorts, 32-bit integers and IEEE-754 binary32 floats. Fixed compatibility fixtures and bidirectional Linux/Windows checks cover those assumptions. Opens validate the complete record structure before enabling read-only mapping.
 
 Each plaintext insert, replacement, or delete builds a complete private sibling file, syncs it, then atomically replaces the backing file. `idydb_rag_upsert_text` stages both text and vector in one snapshot, so an I/O or allocation failure cannot publish only one cell. Encrypted mutations similarly replace a private working image, which is saved by flush or close. Before replacement, failure leaves the previous image unchanged. After replacement, a directory-sync error can report failure while the complete new image is visible; inspect the retained handle before retrying.
 
@@ -149,6 +224,48 @@ Do not share a handler concurrently across threads. Advisory locks coordinate co
 POSIX consumers that pin an existing directory can use `idydb_open_at(directory_fd, "data.db", &handle, flags)` for plaintext access. Open the directory with `O_RDONLY | O_DIRECTORY` so the descriptor can synchronize its entries; Linux `O_PATH` descriptors are rejected before any file is opened or created. It owns a close-on-exec duplicate of the directory descriptor and uses `openat`, `renameat`, and directory sync against that anchor; renaming the parent directory does not redirect writes. Pass a basename, and close the caller's descriptor after open if desired. Symlinks and non-regular entries are refused. Read-only pathname opens also support Linux `/proc/self/fd` snapshots whose original inode has been unlinked. The exchange storage adapter uses these interfaces; they do not provide general multi-call transactions.
 
 Context length limits count bytes and can split a UTF-8 character. Embedding generation requires a caller-provided callback; no embedding model is bundled.
+
+Embedding callbacks allocate their returned vectors with `idydb_alloc`; IdyDB
+then owns and releases them. Other owned outputs are released with `idydb_free`
+or `idydb_value_free`. Using the library's allocator keeps allocation and release
+on the same heap across a Windows DLL boundary.
+
+### Windows storage contract
+
+Windows filenames are UTF-8 and are converted to UTF-16 for all OS calls.
+Extended-length paths support Unicode and long filenames without changing the
+machine's long-path setting. Final-component reparse points and named alternate
+data streams are rejected. Parent junctions resolve to the opened file's
+handle-derived canonical path; pathname opens do not provide the POSIX
+directory-anchor guarantee of `idydb_open_at`.
+
+Atomic Windows updates preserve the original owner, group, DACL, creation time
+and selected basic attributes for ordinary default-stream files. Updates refuse
+EFS-encrypted, compressed, sparse and additional-stream files rather than
+silently stripping those properties. Auditing SACLs and extended attributes are
+outside this initial preservation contract.
+Updates require create/delete access in the containing directory and permission
+to recreate the original owner, group and DACL; preservation failures refuse the update.
+
+Windows commits flush the complete sibling, atomically rename its owning handle
+with `FileRenameInfoEx` replacement/POSIX flags, adopt that complete image, then
+flush the current replacement file. Both file locks remain held through the
+replacement. Unsupported OS/filesystem behavior fails without an unlocked
+fallback or removal of the authoritative file.
+Flush/close retries repeat the last durability check. This is a Windows file
+flush contract; it does not claim POSIX parent-directory synchronization or
+universal power-loss guarantees. Filesystem/storage behavior remains relevant.
+
+Encrypted Windows working storage uses an unpredictable, exclusively created
+plaintext scratch file with an owner-only DACL and delete-on-close lifecycle.
+Plaintext can reach disk; the temporary-file attribute is a cache hint, and
+deletion is not secure erasure or a RAM-only guarantee.
+
+Use Linux-native filesystems or Linux named volumes for Linux database files.
+The tested Docker Desktop Windows bind mount invalidates metadata queries on a
+renamed open descriptor; both the pre-port library and this implementation fail
+later updates there. Native Windows tests exercise NTFS directly and Linux tests
+keep database files inside the Linux volume or container filesystem.
 
 Regression suites cover mixed mutations, malformed records, maximum payloads, full columns, query ranking/filtering, metadata ownership, encryption authentication, C interoperability, and Node lifecycle/input validation. Failure tests inject short writes, disk-full errors, failed seeks/flushes/syncs/replacements, and interruptions before and after replacement; they verify atomic row pairs, borrowed-input safety, retry/discard behavior, and lock release after failed Node finalization.
 

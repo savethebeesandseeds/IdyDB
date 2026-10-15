@@ -24,3 +24,35 @@ jobs:
         run: sh ./setup.sh
       - name: Run regression matrix and Node addon tests
         run: sh ./dev/check.sh
+
+  mingw-cross-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Install pinned Linux, MinGW and Node-API dependencies
+        run: |
+          sh ./setup.sh
+          sh ./dev/setup-mingw.sh
+          sh ./dev/setup-windows-node.sh
+      - name: Cross build Windows libraries, tests, consumers and Node addon
+        run: |
+          sh ./dev/build-windows.sh
+          sh ./dev/build-windows-addon.sh
+      # Native execution is done by dev/test-windows*.ps1 on the authorized host.
+      # Cross compilation alone is not treated as proof of Windows behavior.
+      - name: Preserve Windows SDK packages and native-test payloads
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mingw-windows-x64
+          path: |
+            /build/windows-*/package/*.zip
+            /build/windows-runtime/
+            /build/windows-addon-runtime/
+          if-no-files-found: error
+          retention-days: 7
